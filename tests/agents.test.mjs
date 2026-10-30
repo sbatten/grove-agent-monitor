@@ -9,7 +9,23 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { parseModels } from '../extensions/grove-agent-monitor/lib/process/models.mjs';
 
-const dir = new URL('../agents/', import.meta.url);
+const root = new URL('../', import.meta.url);
+const plugin = JSON.parse(await fs.readFile(new URL('.plugin/plugin.json', root), 'utf8'));
+assert.equal(plugin.name, 'grove-agent-monitor', 'the plugin has a stable install identity');
+assert.match(plugin.version, /^\d+\.\d+\.\d+$/, 'the plugin declares a semantic version');
+assert.ok(plugin.description?.trim(), 'the plugin has a description');
+for (const component of ['agents', 'skills', 'extensions']) {
+  assert.equal(plugin[component], `${component}/`, `${component}: register the bundled directory relative to the plugin root`);
+  assert.ok((await fs.stat(new URL(plugin[component], root))).isDirectory(), `${component}: directory exists`);
+}
+const extensionsDir = new URL(plugin.extensions, root);
+const extensions = (await fs.readdir(extensionsDir, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+assert.ok(extensions.some((entry) => entry.name === 'grove-agent-monitor'), 'the canvas extension is bundled');
+for (const extension of extensions) {
+  assert.ok((await fs.stat(new URL(`${extension.name}/extension.mjs`, extensionsDir))).isFile(), `${extension.name}: SDK entry point exists`);
+}
+
+const dir = new URL(plugin.agents, root);
 const files = (await fs.readdir(dir)).filter((f) => f.endsWith('.agent.md'));
 assert.ok(files.includes('grove-engineer.agent.md'), 'each task\'s engineer has an agent file');
 for (const gone of ['grove-lead', 'grove-planner', 'grove-researcher', 'grove-implementer', 'grove-verifier']) {
@@ -37,7 +53,7 @@ for (const f of files) {
 
 // The engineer loads one skill per kind of step; reviewers get grove-review in their brief. Each skill's front
 // matter must parse, and its name must match its folder.
-const skillsDir = new URL('../skills/', import.meta.url);
+const skillsDir = new URL(plugin.skills, root);
 for (const name of ['grove-plan', 'grove-research', 'grove-execute', 'grove-verify', 'grove-review']) {
   const text = await fs.readFile(new URL(`${name}/SKILL.md`, skillsDir), 'utf8');
   const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
@@ -50,4 +66,4 @@ const { skillInstructions, personaInstructions } = await import('../extensions/g
 assert.match(skillInstructions('grove-review'), /VERDICT: APPROVE/, 'reviewer briefs carry the review skill');
 assert.match(personaInstructions('grove-engineer'), /grove_submit/, 'the engineer brief carries its standing instructions');
 assert.equal(skillInstructions('../etc'), '', 'only grove skills are read');
-console.log(`agent front matter ok (${files.length} agents), skills ok`);
+console.log(`plugin manifest ok (${extensions.length} extensions), agent front matter ok (${files.length} agents), skills ok`);
