@@ -23,7 +23,7 @@
 // turns an extension starts, and some host tools (tool search) don't run in them.
 //
 // Session layout in the host: each engineer is its own top-level session (the Chief starts it with
-// relationship "independent" in the Chief's workspace), and every reviewer is a nested chat inside its
+// relationship "independent" at the task's destination), and every reviewer is a nested chat inside its
 // engineer's session (relationship "currentSession"). So a task's whole team is grouped under its engineer.
 // Grove's preToolUse hook enforces both by correcting the create_session arguments.
 import path from 'node:path';
@@ -40,6 +40,10 @@ import {
 } from './prompts.mjs';
 import { validateEvidence } from './evidence.mjs';
 import { memberModel, engineerModel } from './models.mjs';
+import {
+  PlacementError, DESTINATION_MODES, destination, engineerPlacement, reviewerPlacement,
+  observePlacement, prepareReviewer, repairTarget, confirmationForm, localPath,
+} from './placement.mjs';
 import { taskName, taskLabel, taskTag, findTask } from './names.mjs';
 import { writeReport, reportPath, evidenceRel } from './report.mjs';
 import { TASK_COLORS } from '../../web/model.mjs';
@@ -199,8 +203,8 @@ function isRootCall(input, selfId) {
   return !input?.sessionId || !selfId || input.sessionId === selfId;
 }
 
-// Grove decides how sessions nest. An engineer is always independent; it works in the folder the Chief chose
-// (its own working directory unless the Chief named another). Reviewers are nested in the engineer's session.
+// Grove decides how sessions nest. Engineers use structured task destinations, never the Chief cwd.
+// Reviewers are nested and share by default; an explicit ticket can request separate isolation.
 // Grove also sets each session's model (the engineer's from the task's kind, a reviewer's from its agent
 // file), overriding whatever the caller passed (or left out), so a session never inherits a lighter model
 // from the chat that created it.
@@ -210,15 +214,14 @@ function withModel(args, model) {
   return { ...rest, model };
 }
 
-function placeLead(args, chiefWorkspace, model) {
+function placeLead(args, task, model, override) {
   const { relationship, workspace, worktree, ...rest } = withModel(args, model);
-  if (workspace) return { ...rest, relationship: 'independent', workspace, ...(worktree !== undefined ? { worktree } : {}) };
-  return { ...rest, relationship: 'independent', ...(chiefWorkspace ? { workspace: chiefWorkspace } : {}) };
+  return { ...rest, relationship: 'independent', ...engineerPlacement(task, override) };
 }
 
-function placeMember(args, model) {
+function placeMember(args, model, task, ticket) {
   const { relationship, workspace: _ws, worktree: _wt, ...rest } = withModel(args, model);
-  return { ...rest, relationship: 'currentSession' };
+  return { ...rest, relationship: 'currentSession', ...reviewerPlacement(task, ticket) };
 }
 
 function deny(reason) {
@@ -297,6 +300,9 @@ export class GroveProcess {
     this.sessionError = null; // { message, at, count }: this session's last error, until a turn goes through
     this.turnActed = true; // whether the current turn said or did anything
     this.catchUp = false; // engineer: took over a task under way and hasn't submitted yet
+    this.confirmation = null;
+    this.inputCall = null;
+    this.metadataCalls = new Set();
   }
 
   get ready() {
@@ -370,19 +376,23 @@ export class GroveProcess {
     }
     await this.bind(board, 'lead');
     const task = this.engine.task(taskId);
+    const recovering = !resume && !!task.lead;
     this.leadTaskId = taskId;
     if (resume) {
       if (!this.engine.owns(task)) {
         this.retire();
         return task;
       }
+      await this.invalidateRepair(task);
       await this.collectResults();
       await this.applyLeadDecisions({ wake: true });
+      await this.checkPlacement({ force: true });
       await this.continueLead();
       return task;
     }
     try {
       this.engine.claim(taskId, token);
+      if (board.meta.destinations?.[taskId]) task.destination = destination(board.meta.destinations[taskId]);
       await board.flush();
       if (!this.engine.owns(this.engine.task(taskId)) || this.engine.claimingFrom.has(taskId)) throw new ProcessError('stale_handoff', `${taskId} was taken by another session.`);
     } catch (err) {
@@ -391,12 +401,29 @@ export class GroveProcess {
       throw err;
     }
     await writeLeadLink(this.leadFile, { boardId, taskId });
+    await this.invalidateRepair(task);
     // An engineer taking over a task that's under way catches up from the board: grove_next includes the
     // finished steps' results until it submits something.
     this.catchUp = this.engine.task(taskId).steps.some((x) => x.status === 'done' && x.output);
     await this.collectResults();
     await this.applyLeadDecisions({ wake: false });
+    await this.checkPlacement({ force: true, continuation: recovering });
     return task;
+  }
+
+  async invalidateRepair(task) {
+    this.repairAuthorityReady = false;
+    this.confirmation = null;
+    const hadRepair = !!task.workspaceRepair;
+    delete task.workspaceRepair;
+    const decisions = await this.board.readDecisions(task.id);
+    const through = Math.max(task.repairInvalidatedThrough ?? 0, ...decisions.map((d) => d.seq));
+    if (hadRepair || through !== (task.repairInvalidatedThrough ?? 0)) {
+      task.repairInvalidatedThrough = through;
+      this.engine.changed(task, 'Workspace repair authority invalidated on attachment/restart; a fresh human decision is required.');
+      await this.board.flush();
+    }
+    this.repairAuthorityReady = true;
   }
 
   // Another engineer took the task over: this session goes back to watching.
@@ -438,9 +465,19 @@ export class GroveProcess {
       }
     }
     await this.bind(board, 'member');
-    this.work = { boardId, ticketId, token, revivals: 0, resolved: false, blocks: 0, lastBeat: 0 };
+    this.work = { boardId, ticketId, token, submissionVersion: found.ticket.version, revivals: 0, resolved: false, blocks: 0, lastBeat: 0 };
     this.lastText = '';
     await writeMemberLink(this.memberFile, this.work);
+    if (found.task.destination) {
+      try {
+        await prepareReviewer(found.task, found.ticket, this.workingDirectory ?? this.session?.workingDirectory);
+      } catch (err) {
+        this.work.setupError = `Reviewer setup failed: ${err.message}`;
+        this.log(`Grove reviewer setup failed: ${err.message}`, 'warning');
+      }
+      await writeMemberLink(this.memberFile, this.work);
+      await this.checkPlacement({ force: true });
+    }
     await this.beat(true);
     return found;
   }
@@ -452,7 +489,8 @@ export class GroveProcess {
     const prior = found && (await board.readResult(link.ticketId).catch(() => null));
     const open = found && found.ticket.token === link.token && !TERMINAL.has(found.task.stage)
       && IN_FLIGHT.has(found.ticket.status) && prior?.status !== 'done' && prior?.status !== 'failed';
-    this.work = { ...link, resolved: !open, blocks: 0, lastBeat: 0 };
+    this.work = { ...link, submissionVersion: link.submissionVersion ?? found?.ticket.version, resolved: !open, blocks: 0, lastBeat: 0 };
+    await this.checkPlacement({ force: true });
     if (!open) return;
     await this.beat(true);
     await this.revive('was interrupted when Grove restarted');
@@ -472,7 +510,10 @@ export class GroveProcess {
     // Strictly increasing, so the engineer never mistakes a new beat (an error, or its clearing) for an old one.
     const t = Math.max(Date.now(), (w.lastBeat ?? 0) + 1);
     w.lastBeat = t;
-    await this.board.writeResult({ ticket: w.ticketId, token: w.token, status: 'running', sessionId: this.selfId, heartbeat: t, ...(this.sessionError ? { sessionError: this.sessionError } : {}) });
+    const found = this.currentWork();
+    await this.board.writeResult({ ticket: w.ticketId, token: w.token, status: 'running', sessionId: this.selfId, heartbeat: t,
+      ...(found?.task.destination ? { placement: this.memberPlacement, submissionVersion: w.submissionVersion } : {}),
+      ...(this.sessionError ? { sessionError: this.sessionError } : {}) });
   }
 
   // The engineer's Grove cancelled this reviewer's ticket (task cancelled, escalated or paused): stop.
@@ -496,7 +537,10 @@ export class GroveProcess {
     const w = this.work;
     if (!w || w.resolved) return;
     w.resolved = true;
-    await this.board.writeResult({ ticket: w.ticketId, token: w.token, status, sessionId: this.selfId, ...fields });
+    await this.checkPlacement({ force: true });
+    const found = this.currentWork();
+    await this.board.writeResult({ ticket: w.ticketId, token: w.token, status, sessionId: this.selfId,
+      ...(found?.task.destination ? { placement: this.memberPlacement, submissionVersion: w.submissionVersion } : {}), ...fields });
     await this.board.flush();
   }
 
@@ -886,6 +930,37 @@ export class GroveProcess {
       default:
         break;
     }
+    if (this.role === 'lead' && !ev.agentId) {
+      if (ev.type === 'tool.execution_start' && d.toolName === 'get_current_session') this.metadataCalls.add(d.toolCallId);
+      if (ev.type === 'tool.execution_complete' && this.metadataCalls.delete(d.toolCallId) && d.success !== false) {
+        try {
+          const metadata = typeof d.result?.workingDirectory === 'string' ? d.result : JSON.parse(resultText(d.result));
+          if (typeof metadata.workingDirectory === 'string') this.metadataDirectory = metadata.workingDirectory;
+        } catch (err) {
+          this.log(`Grove could not read current-session placement metadata: ${err.message}`, 'warning');
+        }
+      }
+      if (ev.type === 'tool.execution_start' && d.toolName === 'ask_user') this.inputCall = d.toolCallId;
+      if (ev.type === 'tool.execution_complete' && this.confirmation?.call === d.toolCallId) {
+        let answer = d.result;
+        if (!answer?.workspaceConfirmation) {
+          try {
+            answer = JSON.parse(resultText(d.result));
+          } catch {
+            answer = null;
+          }
+        }
+        this.confirmation.confirmed = d.success !== false && !wasDenied(d) && answer?.workspaceConfirmation === true;
+        if (!this.confirmation.confirmed) {
+          this.confirmation = null;
+          const task = this.leadTask();
+          if (task?.workspaceRepair) {
+            delete task.workspaceRepair;
+            this.engine.changed(task, 'Workspace repair confirmation was not affirmative.');
+          }
+        }
+      }
+    }
     // Chief: remember each engineer's session link (from create_session's result) so the human's decisions
     // can be sent there.
     if (this.role === 'chief' && this.board) {
@@ -925,6 +1000,94 @@ export class GroveProcess {
   }
 
   // ---------- hooks ----------
+
+  async checkPlacement({ force = false, continuation = false } = {}) {
+    const found = this.role === 'member' ? this.currentWork() : null;
+    const task = this.role === 'lead' ? this.leadTask() : found?.task;
+    if (!task?.destination) return;
+    const directory = this.workingDirectory ?? this.session?.workingDirectory ?? this.metadataDirectory;
+    let key = directory;
+    try {
+      key = await fs.realpath(localPath(directory));
+    } catch (err) {
+      if (!(err instanceof PlacementError) && err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
+    }
+    const previous = found ? this.memberPlacement : task.placement;
+    if (!force && !found?.ticket.worktree && previous && key === this.checkedDirectory) return previous;
+    this.checkedDirectory = key;
+    const observed = found && this.work.setupError
+      ? { status: 'invalid', error: this.work.setupError, sessionId: this.selfId, at: Date.now() }
+      : await observePlacement(task, directory, {
+        reviewer: found?.ticket, sessionId: this.selfId, chiefDirectory: task.chiefDirectory, continuation,
+      });
+    const withoutTime = ({ at, ...fields }) => fields;
+    const changed = !previous || JSON.stringify(withoutTime(previous)) !== JSON.stringify(withoutTime(observed));
+    const p = changed ? observed : previous;
+    if (found) {
+      this.memberPlacement = p;
+      return p;
+    }
+    if (!this.engine.owns(task)) return p;
+    task.placement = p;
+    if (p.status === 'verified') {
+      task.lastVerifiedPlacement = p;
+      if (task.stage === 'blocked' && task.pause?.placement) this.engine.unpause(task, 'Actual attachment verified; placement blocker resolved.');
+    }
+    if (changed) this.engine.changed(task, null);
+    if (p.status !== 'verified' && !['blocked', 'on-hold', 'done', 'cancelled', 'awaiting-approval'].includes(task.stage)) {
+      this.engine.block(task.id, { need: 'Confirm the intended attachment with the Chief; authorize supported workspace repair if required.', reason: p.error });
+      task.pause.placement = true;
+      this.engine.changed(task, null);
+    }
+    if (changed) await this.board.flush();
+    return p;
+  }
+
+  placementGate(name, args) {
+    const task = this.leadTask();
+    if (this.confirmation && name !== 'set_workspace') {
+      this.confirmation = null;
+      if (task?.workspaceRepair) {
+        delete task.workspaceRepair;
+        this.engine.changed(task, 'Workspace confirmation invalidated by an intervening tool.');
+      }
+    }
+    if (this.role === 'lead' && ['set_workspace', 'ask_user'].includes(name)) {
+      const authority = task?.workspaceRepair;
+      if (name === 'ask_user') {
+        const properties = args.requestedSchema?.properties;
+        const field = properties?.workspaceConfirmation;
+        const valid = this.repairAuthorityReady && authority?.sessionId === this.selfId
+          && args.message === 'Confirm the authorized workspace repair.'
+          && properties && Object.keys(properties).length === 1
+          && field && Object.keys(field).length === 3 && field.type === 'boolean' && field.default === false
+          && field.title === confirmationForm(authority.target).title;
+        if (!valid) return deny('Grove: ordinary questions and engineer-initiated workspace repair are not authorized. For a human prerequisite use grove_blocked; put ordinary decision questions in the delivery ask. Only the Chief can record an explicit human workspaceRepair decision.');
+        this.confirmation = { seq: authority.seq, target: authority.target, call: this.inputCall, confirmed: false };
+        return undefined;
+      }
+      const consent = this.confirmation;
+      const matches = this.repairAuthorityReady && authority?.sessionId === this.selfId && consent?.confirmed && consent.seq === authority.seq
+        && args.workspaceFolder === consent.target.workspaceFolder && args.isolation === consent.target.isolation;
+      this.confirmation = null;
+      if (authority) {
+        delete task.workspaceRepair;
+        this.engine.changed(task, 'Workspace repair authorization consumed.');
+      }
+      return matches ? undefined : deny('Grove: set_workspace requires an explicit human repair decision and immediately preceding affirmative confirmation of this exact workspace/isolation.');
+    }
+    if (['set_workspace', 'isolate_session', 'move_session', 'ask_user'].includes(name) && this.role === 'member') {
+      return deny('Grove: reviewers cannot change their attachment or ask the human; report the placement prerequisite to the engineer.');
+    }
+    if (this.role === 'lead' && ['isolate_session', 'move_session'].includes(name)) return deny('Grove: use only the explicitly authorized, confirmed set_workspace repair route.');
+    const p = this.role === 'lead' ? task?.placement : this.memberPlacement;
+    const routed = task?.destination || this.currentWork()?.task.destination;
+    if (routed && p?.status !== 'verified' && !(name.startsWith('grove_') || isDiscoveryTool(name)
+      || ['get_current_session', 'list_sessions', 'get_session_context', 'send_message', 'report_intent'].includes(name))) {
+      return deny(`Grove: work is gated until actual placement is verified. ${p?.error ?? 'Per-chat working directory is unknown.'}`);
+    }
+    return undefined;
+  }
 
   hooks() {
     return {
@@ -978,15 +1141,24 @@ export class GroveProcess {
           if (!(name.startsWith('grove_') || CHIEF_TOOLS.has(name) || isDiscoveryTool(name))) {
             return deny(`Grove: the Chief of Staff coordinates and never does the work itself, so "${name}" is not available. For anything to do or find out (a comment, a label, a merge, checking a PR, reading files), send it to a team: record it on the task it belongs to with grove_record_decision ("changes", "note" or "question"; "changes" reopens a finished task), or start a new task with grove_create_task. For how a task is going, use grove_status.`);
           }
-          // Every engineer is its own top-level session in the Chief's workspace, on its task's model.
+          // Valid handoffs use the task's destination and model, not caller-supplied placement.
           const handoff = name === 'create_session' ? LEAD_MARKER.exec(String(args.prompt ?? '')) : null;
           if (handoff) {
             const t = this.engine?.state.tasks.find((x) => x.id === handoff[2]);
-            return { modifiedArgs: placeLead(args, this.leadWorkspace(), engineerModel(t?.kind ?? 'code')) };
+            if (handoff[1] !== this.board.id || !t || this.board.meta.handoffs?.[t.id] !== handoff[3]) return deny('Grove: invalid or stale engineer handoff.');
+            try {
+              return { modifiedArgs: placeLead(args, t, engineerModel(t.kind), this.board.meta.destinations?.[t.id]) };
+            } catch (err) {
+              if (err instanceof PlacementError) return deny(`Grove: ${err.message} Supply an explicit destination with grove_handoff.`);
+              throw err;
+            }
           }
           return undefined;
         }
         if (this.role === 'member') {
+          await this.checkPlacement();
+          const gate = this.placementGate(name, args);
+          if (gate) return gate;
           if (name === 'send_message' && this.board && sameSession(args.session, this.board.meta.chiefLink)) {
             return deny('Grove: reviewers report to the task\'s engineer, not the Chief of Staff. Put everything in your final message (your review); if only the human can unblock you, end it with "BLOCKED: <what the human must do>".');
           }
@@ -998,10 +1170,14 @@ export class GroveProcess {
           return undefined;
         }
         if (this.role !== 'lead') return undefined;
+        if (!['set_workspace', 'ask_user'].includes(name)) await this.checkPlacement({
+          force: ['create_session', 'grove_submit', 'grove_deliver', 'grove_next'].includes(name),
+        });
+        const gate = this.placementGate(name, args);
+        if (gate) return gate;
         // The engineer does the work itself, with every tool. Reviewers are hired only through Grove's tickets;
         // it may use subagents for side lookups, but they never count as reviews.
         if (HIRE_TOOLS.has(name)) return this.gateHire(name, args);
-        if (name === 'ask_user') return deny('Grove: don\'t ask the human here; they talk to the Chief of Staff. If only they can unblock the task, call grove_blocked with exactly what they must do. If you need a decision, make the best call, note it, and put the question in your ask when you deliver.');
         return undefined;
       },
       onAgentStop: async (input) => {
@@ -1124,7 +1300,7 @@ export class GroveProcess {
       throw err;
     }
     this.stopBlocks = 0;
-    return tool === 'create_session' ? { modifiedArgs: placeMember(args, memberModel(found.task, found.ticket)) } : undefined;
+    return tool === 'create_session' ? { modifiedArgs: placeMember(args, memberModel(found.task, found.ticket), found.task, found.ticket) } : undefined;
   }
 
   // ---------- tools ----------
@@ -1147,11 +1323,17 @@ export class GroveProcess {
         }
         return { textResultForLlm: text(await fn(args ?? {})), resultType: 'success' };
       } catch (err) {
-        if (err instanceof ProcessError || err instanceof BoardError) return { textResultForLlm: `Grove: ${err.message}`, resultType: 'failure' };
+        if (err instanceof ProcessError || err instanceof BoardError || err instanceof PlacementError) return { textResultForLlm: `Grove: ${err.message}`, resultType: 'failure' };
         throw err;
       }
     };
     const taskId = { type: 'string', description: 'The task\'s id such as "T1", or its name such as "Moonfern".' };
+    const destinationSchema = {
+      type: 'object', properties: {
+        mode: { type: 'string', enum: DESTINATION_MODES },
+        workspace: { type: 'string', description: 'Absolute authorized repository/folder or exact existing worktree; omit for scratch.' },
+      }, required: ['mode'], additionalProperties: false,
+    };
     const CHIEF = ['chief'];
     const LEAD = ['lead'];
     return [
@@ -1165,12 +1347,13 @@ export class GroveProcess {
             goal: { type: 'string', description: 'What the user wants, in full, including constraints and context.' },
             criteria: { type: 'array', items: { type: 'string' }, description: 'Acceptance criteria the human will validate.' },
             kind: { type: 'string', enum: [...TASK_KINDS], description: 'What the task is: "code" for a change to a repository (the engineer runs on Opus), "research" for finding things out (data, issues, docs), "other" for anything else, such as filing or labelling issues (both run on Sol).' },
+            destination: destinationSchema,
             chiefSession: { type: 'string', description: 'Your own session link (the openLink from get_current_session), so the engineer can message you when the human is needed. Required for your first task; use "none" only if the host has no session tools.' },
           },
-          required: ['title', 'goal', 'kind'],
+          required: ['title', 'goal', 'kind', 'destination'],
         },
         // The first task turns a plain session into the Chief of Staff.
-        handler: guarded(['chief', 'none'], async ({ title, goal, criteria, kind, chiefSession }) => {
+        handler: guarded(['chief', 'none'], async ({ title, goal, criteria, kind, chiefSession, destination: intent }) => {
           if (!TASK_KINDS.includes(kind)) throw new ProcessError('invalid_input', `kind must be one of ${TASK_KINDS.join(', ')}: "code" for a change to a repository, "research" for finding things out, "other" for anything else.`);
           if (typeof title !== 'string' || !title.trim() || typeof goal !== 'string' || !goal.trim()) throw new ProcessError('invalid_input', 'title and goal are required.');
           if (criteria !== undefined && (!Array.isArray(criteria) || criteria.some((c) => typeof c !== 'string'))) throw new ProcessError('invalid_input', 'criteria must be an array of strings.');
@@ -1178,6 +1361,7 @@ export class GroveProcess {
           if (!chiefSession && !(this.role === 'chief' && this.board.meta.chiefLink)) {
             throw new ProcessError('invalid_input', 'Pass chiefSession: call get_current_session and use its openLink, so the engineer can message you when the human is needed.');
           }
+          const target = destination(intent);
           if (this.role !== 'chief') await this.becomeChief();
           if (isSessionLink(chiefSession)) this.board.meta.chiefLink = chiefSession.split('?')[0];
           const n = this.board.meta.nextTask++;
@@ -1185,7 +1369,7 @@ export class GroveProcess {
           const token = newHandoffToken();
           this.board.meta.handoffs[id] = token;
           await this.board.saveMeta();
-          const t = this.engine.createTask({ id, name: taskName(this.board.id, n), title, goal, criteria: criteria ?? [], kind });
+          const t = this.engine.createTask({ id, name: taskName(this.board.id, n), title, goal, criteria: criteria ?? [], kind, destination: target, chiefDirectory: this.leadWorkspace() });
           await this.board.flush();
           return { task: id, name: t.name, handoff: this.handoff(t, token), guidance: this.handoffGuidance(t) };
         }),
@@ -1193,13 +1377,17 @@ export class GroveProcess {
       {
         name: 'grove_handoff',
         description: 'Chief of Staff: get a fresh hand-off for a task whose engineer session never started, stalled or was lost. A new engineer takes the task over and picks it up from the board; the old hand-off stops working.',
-        parameters: { type: 'object', properties: { taskId }, required: ['taskId'] },
-        handler: guarded(CHIEF, async ({ taskId: id }) => {
+        parameters: { type: 'object', properties: { taskId, destination: destinationSchema }, required: ['taskId'] },
+        handler: guarded(CHIEF, async ({ taskId: id, destination: intent }) => {
           await this.engine.refresh();
           const t = this.engine.task(id);
           if (TERMINAL.has(t.stage)) throw new ProcessError('invalid_state', `${id} is ${t.stage}.`);
+          const target = intent ? destination(intent) : t.lastVerifiedPlacement?.repository
+            ? { mode: 'existing-worktree', workspace: t.lastVerifiedPlacement.directory }
+            : destination(t.destination ?? this.board.meta.destinations?.[id]);
           const token = newHandoffToken();
           this.board.meta.handoffs[id] = token;
+          this.board.meta.destinations = { ...this.board.meta.destinations, [id]: target };
           await this.board.saveMeta();
           return { task: id, ...(t.name ? { name: t.name } : {}), handoff: this.handoff(t, token), guidance: this.handoffGuidance(t) };
         }),
@@ -1234,14 +1422,16 @@ export class GroveProcess {
             decision: { type: 'string', enum: [...DECISIONS] },
             note: { type: 'string', description: 'The human\'s own words (required for changes, note and question).' },
             ship: { type: 'boolean', description: 'approve only: false to finish a code change without opening a PR.' },
+            workspaceRepair: { type: 'boolean', description: 'retry/note only: the human explicitly requested attachment repair. Target/isolation derive from recorded destination, never note text.' },
           },
           required: ['taskId', 'decision'],
         },
-        handler: guarded(CHIEF, async ({ taskId: id, decision, note, ship }) => {
+        handler: guarded(CHIEF, async ({ taskId: id, decision, note, ship, workspaceRepair }) => {
           if (!DECISIONS.includes(decision)) throw new ProcessError('invalid_input', `decision must be one of ${DECISIONS.join(', ')}.`);
           if (ship !== undefined && typeof ship !== 'boolean') throw new ProcessError('invalid_input', 'ship must be true or false.');
+          if (workspaceRepair !== undefined && (typeof workspaceRepair !== 'boolean' || !['retry', 'note'].includes(decision))) throw new ProcessError('invalid_input', 'workspaceRepair is boolean and valid only for explicit human retry/note.');
           const msg = typeof note === 'string' ? note.trim() : '';
-          return this.recordDecision(id, decision, msg, { ship });
+          return this.recordDecision(id, decision, msg, { ship, workspaceRepair });
         }),
       },
       {
@@ -1275,7 +1465,7 @@ export class GroveProcess {
                   reviewers: {
                     type: 'array',
                     description: 'Who reviews this step\'s output (unanimous). A built-in name, or { name, focus } for your own.',
-                    items: { anyOf: [{ type: 'string' }, { type: 'object', properties: { name: { type: 'string' }, focus: { type: 'string' } }, required: ['name'] }] },
+                    items: { anyOf: [{ type: 'string' }, { type: 'object', properties: { name: { type: 'string' }, focus: { type: 'string' }, worktree: { type: 'boolean', description: 'Opt into a separate reviewer worktree; requires provider support and a committed code snapshot.' } }, required: ['name'] }] },
                   },
                 },
                 required: ['kind'],
@@ -1414,25 +1604,24 @@ export class GroveProcess {
     ];
   }
 
-  // The Chief's working directory, where engineers (and their reviewers) work.
+  // Used only to detect accidental scratch sharing, never as a destination.
   leadWorkspace() {
     return this.workingDirectory || this.session?.workingDirectory || undefined;
   }
 
   handoff(task, token) {
-    const workspace = this.leadWorkspace();
     return {
       title: `${taskTag(task)} · ${task.title}`.slice(0, 120),
       prompt: engineerHandoff(task, { boardId: this.board.id, token }),
       relationship: 'independent',
-      ...(workspace ? { workspace } : {}),
+      ...engineerPlacement(task, this.board.meta.destinations?.[task.id]),
       ...(engineerModel(task.kind) ? { model: engineerModel(task.kind) } : {}),
     };
   }
 
   handoffGuidance(t) {
     const label = taskLabel(t);
-    return `Start the engineer now: call create_session with exactly these handoff fields (title, prompt, relationship "independent", model, and workspace when given). Each engineer gets its own top-level session, so its reviewers are grouped under it. Pass workspace yourself only if the work is in a different folder. Then tell the human ${label} has started (link the new session)${t.name ? `, calling it by its name, ${t.name}, so they can refer to it that way` : ''}, and end your turn. ${label}'s engineer messages this chat when the human is needed.`;
+    return `Start the engineer now: call create_session with exactly these handoff fields, including workspace/worktree only when returned. Destination is structured, never the Chief's scratch directory or inferred from prose. The engineer verifies its actual attachment before work; existing-worktree redirection requires supported confirmed repair, not a new branch or a silent primary checkout. Then tell the human ${label} has started (link the new session)${t.name ? `, calling it by its name, ${t.name}, so they can refer to it that way` : ''}, and end your turn.`;
   }
 
   // ---------- reports and the Grove inbox ----------
@@ -1610,13 +1799,22 @@ export class GroveProcess {
     };
   }
 
-  async recordDecision(id, decision, note, { via = 'chat', ship } = {}) {
+  async recordDecision(id, decision, note, { via = 'chat', ship, workspaceRepair } = {}) {
     await this.engine.refresh();
     const t = this.engine.task(id);
     const err = this.engine.decisionError(t, decision, note, { ship });
     if (err) throw new ProcessError('invalid_state', err);
     const before = t.stage;
-    const item = await this.board.appendDecision(id, { action: decision, note, via, ...(typeof ship === 'boolean' ? { ship } : {}) });
+    let repair;
+    if (workspaceRepair) {
+      if (!t.lead?.sessionId) throw new PlacementError('Workspace repair needs an existing engineer.');
+      const target = repairTarget(t);
+      target.workspaceFolder = await fs.realpath(localPath(target.workspaceFolder));
+      if (!(await fs.stat(target.workspaceFolder)).isDirectory()) throw new PlacementError('Repair target is not a directory.');
+      repair = { sessionId: t.lead.sessionId, target };
+    }
+    const item = await this.board.appendDecision(id, { action: decision, note, via,
+      ...(typeof ship === 'boolean' ? { ship } : {}), ...(repair ? { workspaceRepair: repair } : {}) });
     if (this.engine.owns(t)) this.engine.applyDecisions(t, await this.board.readDecisions(id));
     const outcome = decisionOutcome(t, before, decision, ship);
     const leadLink = t.lead?.link ?? this.board.meta.leadLinks?.[id];
@@ -1690,7 +1888,15 @@ export class GroveProcess {
     else if (waitingHires.length) guidance = `Hires ${waitingHires.map((k) => k.id).join(', ')} wait until the host's message limit resets (about ${new Date(Math.max(...waitingHires.map((k) => k.retryAt))).toISOString().slice(11, 16)} UTC). End your turn; Grove offers them again then.`;
     else guidance = 'Nothing to do right now.';
     if (question && !guidance.startsWith('The human asked')) guidance += ` The human also asked: "${question.text}". Answer it with grove_answer once you can.`;
-    return { task: task.id, stage: stageLabel(task), guidance, ...(work ? { work } : {}), hires, messages: messages.map(({ id, ...m }) => m), inFlight, steps: this.stepsSummary(task), ...(results ? { results } : {}) };
+    return { task: task.id, stage: stageLabel(task), guidance, ...(work ? { work } : {}),
+      ...(task.destination ? { destination: task.destination, placement: task.placement ?? { status: 'unknown' } } : {}),
+      ...(task.workspaceRepair ? { workspaceRepair: {
+        target: task.workspaceRepair.target,
+        confirmation: { message: 'Confirm the authorized workspace repair.', requestedSchema: {
+          properties: { workspaceConfirmation: confirmationForm(task.workspaceRepair.target) },
+        } },
+      } } : {}),
+      hires, messages: messages.map(({ id, ...m }) => m), inFlight, steps: this.stepsSummary(task), ...(results ? { results } : {}) };
   }
 
   // What the engineer should do when no step is in progress.
@@ -1749,9 +1955,10 @@ export class GroveProcess {
         title: t.title,
         stage: stageLabel(t),
         kind: t.kind,
+        ...(t.destination ? { destination: t.destination, placement: t.placement ?? { status: 'unknown' } } : {}),
         engineer: t.lead ? { session: t.lead.link ?? this.board.meta.leadLinks?.[t.id] ?? null, status: 'working in its own session' } : TERMINAL.has(t.stage) ? null : 'not started: call grove_handoff and create_session',
         ...(errorText(t.lead?.error) ? { engineerError: errorText(t.lead.error) } : {}),
-        reviewers: Object.values(t.members ?? {}).map((m) => ({ reviewer: m.title, session: m.link, status: m.status })),
+        reviewers: Object.values(t.members ?? {}).map((m) => ({ reviewer: m.title, session: m.link, status: m.status, worktree: !!m.worktree })),
         steps: this.stepsSummary(t),
         delivery: t.delivery ? { summary: t.delivery.summary, ship: !!t.delivery.ship } : null,
         escalation: t.escalation,

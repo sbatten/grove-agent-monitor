@@ -23,10 +23,11 @@ const groupOf = (s) => s.link.split('?')[0];
 
 // A fake session: event listeners plus a record of what Grove posted into it with session.send (the
 // fallback path; visible hand-offs go through send_message instead). Fallback wakes are off by default.
-async function startSession(id, { link, graceMs = 10 * 60 * 1000 } = {}) {
+async function startSession(id, { link, workingDirectory = path.join(tmp, id, 'cwd'), graceMs = 10 * 60 * 1000 } = {}) {
   const listeners = [];
   const sent = [];
-  const session = { sessionId: id, workspacePath: path.join(tmp, id), on: (fn) => listeners.push(fn), send: async (m) => { sent.push(typeof m === 'string' ? m : m.prompt); return `m${sent.length}`; } };
+  await fs.mkdir(workingDirectory, { recursive: true });
+  const session = { sessionId: id, workingDirectory, workspacePath: path.join(tmp, id), on: (fn) => listeners.push(fn), send: async (m) => { sent.push(typeof m === 'string' ? m : m.prompt); return `m${sent.length}`; } };
   const proc = new GroveProcess({ log: () => {}, onChange: () => {}, pollMs: 0, graceMs, prPollMs: 0, prStatus: async () => { if (ghState instanceof Error) throw ghState; return ghState; } });
   const tools = Object.fromEntries(proc.tools().map((t) => [t.name, t]));
   const hooks = proc.hooks();
@@ -93,7 +94,7 @@ async function dispatch(from, h, { fail = false } = {}) {
     return { failed: true };
   }
   const link = `${groupOf(from)}?chat=member-${++nchat}`;
-  const member = await startSession(`member-${nchat}`, { link });
+  const member = await startSession(`member-${nchat}`, { link, workingDirectory: from.session.workingDirectory });
   from.emit({ type: 'tool.execution_complete', data: { toolCallId, success: true, result: { content: `Chat created in the current session (${link}).` } } });
   const up = await member.hooks.onUserPromptSubmitted({ prompt: args.prompt, sessionId: member.id });
   return { member, link, brief: up?.modifiedPrompt ?? '', context: up?.additionalContext ?? '' };
@@ -169,10 +170,10 @@ res = await chief.call('grove_create_task', { title: 'Add dark mode', goal: 'Use
 assert.match(res.data, /kind must be one of code, research, other/);
 assert.equal(chief.proc.role, 'none');
 
-// 2. The first task makes it the Chief. The hand-off is a short marker that starts an independent engineer
-//    session in the Chief's workspace, on the model for a code change.
-await chief.hooks.onUserPromptSubmitted({ prompt: 'Add dark mode', workingDirectory: '/work/app' });
-res = await chief.call('grove_create_task', { title: 'Add dark mode', goal: 'Users want dark mode', criteria: ['Toggle in settings', 'Persists'], kind: 'code', chiefSession: chief.link });
+// 2. The first task makes it the Chief. The hand-off starts an independent scratch engineer,
+//    without copying the Chief's directory, on the model for a code change.
+await chief.hooks.onUserPromptSubmitted({ prompt: 'Add dark mode', workingDirectory: chief.session.workingDirectory });
+res = await chief.call('grove_create_task', { title: 'Add dark mode', goal: 'Users want dark mode', criteria: ['Toggle in settings', 'Persists'], kind: 'code', destination: { mode: 'scratch' }, chiefSession: chief.link });
 assert.equal(res.ok, true, res.data);
 assert.equal(res.data.task, 'T1');
 // Each task gets a mystical name the human can use instead of its number.
@@ -183,13 +184,14 @@ assert.match(handoff1, /^\[grove-engineer:chief-1\/T1\/[a-f0-9]+\] Grove task Ta
 assert.equal(res.data.handoff.title, 'Tansy · Add dark mode', 'the engineer session is titled by name');
 assert.match(res.data.guidance, /tell the human Tansy \(T1\) has started .*calling it by its name, Tansy/);
 assert.equal(res.data.handoff.relationship, 'independent');
-assert.equal(res.data.handoff.workspace, '/work/app');
+assert.equal(res.data.handoff.workspace, undefined);
+assert.equal(res.data.handoff.worktree, undefined);
 assert.equal(res.data.handoff.model, 'claude-opus-5.5', 'a code change runs on Opus');
 assert.match(res.data.guidance, /Start the engineer now: call create_session/);
 let placed = await chief.hooks.onPreToolUse({ toolName: 'create_session', toolArgs: { title: 'T1', prompt: handoff1, relationship: 'currentSession', model: 'claude-haiku-5.5' } });
-assert.deepEqual(placed.modifiedArgs, { title: 'T1', prompt: handoff1, relationship: 'independent', workspace: '/work/app', model: 'claude-opus-5.5' }, 'Grove makes the engineer an independent session on its model, never a lighter one');
+assert.deepEqual(placed.modifiedArgs, { title: 'T1', prompt: handoff1, relationship: 'independent', model: 'claude-opus-5.5' }, 'Scratch engineer has its own independent session, never the Chief directory');
 placed = await chief.hooks.onPreToolUse({ toolName: 'create_session', toolArgs: { title: 'x', prompt: handoff1, workspace: '/other/repo', worktree: true } });
-assert.deepEqual(placed.modifiedArgs, { title: 'x', prompt: handoff1, relationship: 'independent', workspace: '/other/repo', worktree: true, model: 'claude-opus-5.5' }, 'a folder the Chief chose is kept');
+assert.deepEqual(placed.modifiedArgs, { title: 'x', prompt: handoff1, relationship: 'independent', model: 'claude-opus-5.5' }, 'structured scratch routing strips accidental caller placement');
 assert.equal(await chief.hooks.onPreToolUse({ toolName: 'create_session', toolArgs: { title: 'x', prompt: 'unrelated' } }), undefined, 'other sessions are untouched');
 assert.equal((await chief.hooks.onPreToolUse({ toolName: 'task', toolArgs: { agent_type: 'explore', prompt: 'x' } })).permissionDecision, 'deny', 'the Chief never hires');
 assert.equal((await chief.hooks.onPreToolUse({ toolName: 'ask_user', toolArgs: {} })).permissionDecision, 'deny', 'the Chief stays available');
@@ -232,7 +234,7 @@ assert.equal(chief.proc.board.meta.leadLinks.T1, eng.link, 'the Chief remembers 
 //    and never asks the human directly or messages the Chief with updates.
 for (const tool of ['edit', 'bash', 'view', 'skill', 'openBrowserPage']) assert.equal(await eng.hooks.onPreToolUse({ toolName: tool, toolArgs: {} }), undefined, `the engineer can use ${tool}`);
 assert.equal(await eng.hooks.onPreToolUse({ toolName: 'task', toolArgs: { agent_type: 'explore', prompt: 'find the theme code' } }), undefined, 'subagents for side lookups are fine');
-assert.match((await eng.hooks.onPreToolUse({ toolName: 'ask_user', toolArgs: {} })).permissionDecisionReason, /don't ask the human here/);
+assert.match((await eng.hooks.onPreToolUse({ toolName: 'ask_user', toolArgs: {} })).permissionDecisionReason, /ordinary questions/);
 assert.match((await eng.hooks.onPreToolUse({ toolName: 'create_session', toolArgs: { title: 'x', prompt: 'do it' } })).permissionDecisionReason, /the only sessions you start are your reviewers/);
 assert.equal(await eng.hooks.onPreToolUse({ toolName: 'send_message', toolArgs: { session: 'x', message: 'hello' } }), undefined, 'plain messages are fine');
 assert.match((await send(eng, chief.link, 'T1 update: planning.')).denied, /Post progress with grove_update/);
@@ -462,7 +464,7 @@ chief.sent.length = 0;
 
 // 11. Research runs on Sol. A reviewer blocked on the human pauses the task; "retry" puts it back to work
 //     in the same chat. A question is answered by the engineer; "hold" stops everyone without waking it.
-res = await chief.call('grove_create_task', { title: 'Usage numbers', goal: 'Weekly active users for the agents window.', kind: 'research' });
+res = await chief.call('grove_create_task', { title: 'Usage numbers', goal: 'Weekly active users for the agents window.', kind: 'research', destination: { mode: 'scratch' } });
 assert.equal(res.data.handoff.model, 'gpt-6.1-sol', 'research runs on Sol');
 const h2 = res.data.handoff.prompt;
 await settle(chief);
@@ -527,7 +529,7 @@ assert.equal(chief.sent.length, 0, 'and every notice reached the Chief as a mess
 
 // 12. A stalled engineer is woken in its own chat; a new engineer can take a task over and catches up from
 //     the board.
-res = await chief.call('grove_create_task', { title: 'File issues', goal: 'File an issue for each flaky test.', kind: 'other' });
+res = await chief.call('grove_create_task', { title: 'File issues', goal: 'File an issue for each flaky test.', kind: 'other', destination: { mode: 'scratch' } });
 const h3 = res.data.handoff.prompt;
 await settle(chief);
 const eng3 = await startSession('eng-3', { graceMs: 0 });
@@ -570,7 +572,7 @@ assert.equal(eng3b.proc.engine.task('T3').stage, 'done', 'the engineer applies a
 //     its sprite until a turn goes through again. A turn that says and does nothing isn't pushed again.
 const noResponse = 'No response was returned. Send your message again to retry.';
 const pause = () => new Promise((resolve) => setTimeout(resolve, 20));
-res = await chief.call('grove_create_task', { title: 'Flaky', goal: 'A task whose sessions hit errors.', kind: 'research' });
+res = await chief.call('grove_create_task', { title: 'Flaky', goal: 'A task whose sessions hit errors.', kind: 'research', destination: { mode: 'scratch' } });
 const h4 = res.data.handoff.prompt;
 await settle(chief);
 const eng4 = await startSession('eng-4');
@@ -628,7 +630,7 @@ assert.deepEqual(['a', 'b', 'c', 'd', 'e', 'security'].map(seat), ['grok-4.7', '
 // 16. The shelf. A task waiting on the human can be set aside: it leaves the inbox (at once, before its
 //     engineer's Grove applies it), the Chief leaves the lantern, and the engineer isn't woken. Bringing it
 //     back puts it exactly where it was; answering it from chat takes it off the shelf too.
-res = await chief.call('grove_create_task', { title: 'Weekly numbers', goal: 'Weekly active users, every week.', kind: 'research' });
+res = await chief.call('grove_create_task', { title: 'Weekly numbers', goal: 'Weekly active users, every week.', kind: 'research', destination: { mode: 'scratch' } });
 const h5 = res.data.handoff.prompt;
 await settle(chief);
 const eng5 = await startSession('eng-5');
