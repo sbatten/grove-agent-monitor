@@ -316,6 +316,39 @@ paths in `engine.mjs` and `prompts.mjs` go away.
 
 ## Decisions
 
+### Task-aware workspace routing
+
+Task intent is a structured `destination`, separate from observed `placement`.
+New repository changes request managed isolation at creation; continuations
+retain the verified checkout/branch; repository research requests a direct
+Git checkout folder; non-repository work omits workspace for independent host
+scratch. `read-only` intentionally requires Git identity, not an arbitrary folder.
+The Chief cwd and goal prose are never routing inputs. Legacy active tasks keep
+their history and attachment; legacy recovery requires explicit intent.
+
+Nested reviewers share by default. Step reviewer objects may opt into
+`worktree: true`. Code submissions then require clean committed content and pin
+the full SHA. A supporting host creates the separate checkout, potentially at
+its default branch. Grove selects the pinned revision only in that clean linked
+checkout, detached with hooks disabled, and verifies HEAD and cleanliness before
+work and at review acceptance. Failed preparation remains blocking across restart
+until reassignment. Reports echo the assigned submission version independently
+of refreshed ticket state. Providers that cannot support the requested layout
+fail explicitly.
+
+Actual per-chat hook cwd outranks session-level metadata. A creation success is
+not attachment proof: independent `worktree: false` can canonicalize a linked
+checkout back to its primary repo. Work is gated on observed identity. Repair
+requires an explicit human decision recorded by the Chief and a separate
+immediate affirmative workspace/isolation form before the matching
+`set_workspace`; failure never grants repair authority. No general question or
+isolate/move exception is introduced. Restart invalidates old authority and
+consent using the current decision sequence; only a fresh Chief decision can
+authorize another form. Ordinary same-checkout branch/HEAD changes are allowed;
+full identity checks happen at attachment and submission/dispatch boundaries or
+directory changes. Unchanged observations do not rewrite task state.
+Board format/owner-write rules stay intact.
+
 1. **Engineer model:** chosen by task kind: Opus 5.5 for code, Sol 6.1 for
    research and other work.
 2. **Verify reviewer:** yes, the tests reviewer reviews `verify` by default.

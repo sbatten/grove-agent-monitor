@@ -307,9 +307,10 @@ export class Board {
 
   // Chief only: append the human's decision for the task's owner to apply.
   // `via` is 'grove' when the human decided in the canvas inbox rather than in the Chief's chat.
-  async appendDecision(taskId, { action, note, via = 'chat' }) {
+  async appendDecision(taskId, { action, note, via = 'chat', ship, workspaceRepair }) {
     const items = await this.readDecisions(taskId);
-    const item = { seq: (items.at(-1)?.seq ?? 0) + 1, action, note, via, at: Date.now() };
+    const item = { seq: (items.at(-1)?.seq ?? 0) + 1, action, note, via, at: Date.now(),
+      ...(ship !== undefined ? { ship } : {}), ...(workspaceRepair ? { workspaceRepair } : {}) };
     items.push(item);
     await this.queue(() => writeJson(this.decisionsFile(taskId), { format: FORMATS.decisions, version: VERSION, task: taskId, items }));
     return item;
@@ -371,9 +372,12 @@ export async function readMemberLink(file) {
   const data = await readJson(file, MEMBER_FORMAT);
   if (!data) return null;
   if (!isBoardId(data.boardId) || !isTicketId(data.ticketId) || typeof data.token !== 'string') throw new BoardError('storage_corrupt', `${file} is malformed; leaving it untouched.`);
-  return { boardId: data.boardId, ticketId: data.ticketId, token: data.token, revivals: Number.isInteger(data.revivals) ? data.revivals : 0 };
+  return { boardId: data.boardId, ticketId: data.ticketId, token: data.token, revivals: Number.isInteger(data.revivals) ? data.revivals : 0,
+    ...(Number.isInteger(data.submissionVersion) ? { submissionVersion: data.submissionVersion } : {}),
+    ...(typeof data.setupError === 'string' ? { setupError: data.setupError } : {}) };
 }
 
-export function writeMemberLink(file, { boardId, ticketId, token, revivals = 0 }) {
-  return writeJson(file, { format: MEMBER_FORMAT, version: VERSION, boardId, ticketId, token, revivals, at: Date.now() });
+export function writeMemberLink(file, { boardId, ticketId, token, revivals = 0, submissionVersion, setupError }) {
+  return writeJson(file, { format: MEMBER_FORMAT, version: VERSION, boardId, ticketId, token, revivals,
+    ...(submissionVersion !== undefined ? { submissionVersion } : {}), ...(setupError ? { setupError } : {}), at: Date.now() });
 }

@@ -27,6 +27,7 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { taskName, taskLabel } from './names.mjs';
+import { destination, committedSnapshot, reviewerMatches, observePlacement } from './placement.mjs';
 
 export const MAX_ROUNDS = 3;
 // Review rounds on one step before it always goes to the human, however often they send it back.
@@ -279,12 +280,14 @@ export function normalizeSteps({ template, steps }) {
     const rs = reviewers.map((r) => {
       const name = typeof r === 'string' ? r : r?.name;
       const focus = typeof r === 'object' && r ? r.focus : undefined;
+      const worktree = typeof r === 'object' && r ? r.worktree : undefined;
       if (typeof name !== 'string' || !NAME.test(name)) throw new ProcessError('invalid_input', `Step ${i + 1}: reviewer names are short lowercase words (for example "accuracy"), got ${JSON.stringify(name)}.`);
       if (seen.has(name)) throw new ProcessError('invalid_input', `Step ${i + 1}: reviewer "${name}" is listed twice.`);
       seen.add(name);
       if (focus !== undefined && typeof focus !== 'string') throw new ProcessError('invalid_input', `Step ${i + 1}: reviewer focus must be a string.`);
+      if (worktree !== undefined && typeof worktree !== 'boolean') throw new ProcessError('invalid_input', `Step ${i + 1}: reviewer worktree must be boolean.`);
       if (!REVIEWER_FOCUS[name] && !focus?.trim()) throw new ProcessError('invalid_input', `Step ${i + 1}: "${name}" is not a built-in reviewer (${Object.keys(REVIEWER_FOCUS).join(', ')}); give it a focus: { "name": "${name}", "focus": "what to check" }.`);
-      return { name, focus: clip(focus?.trim() || REVIEWER_FOCUS[name], 600) };
+      return { name, focus: clip(focus?.trim() || REVIEWER_FOCUS[name], 600), ...(worktree !== undefined ? { worktree } : {}) };
     });
     if (rs.length > 6) throw new ProcessError('invalid_input', `Step ${i + 1}: at most 6 reviewers.`);
     return { kind: s.kind, title: clip(s.title?.trim() || DEFAULT_TITLES[s.kind], 80), brief: clip(s.brief?.trim() ?? '', 4000), reviewers: rs };
@@ -488,12 +491,14 @@ export class ProcessEngine {
   // ---------- task lifecycle ----------
 
   // Called by the Chief of Staff, who owns the task until its engineer claims it. The engineer chooses its steps.
-  createTask({ id, name, title, goal, criteria = [], kind = 'code' }) {
+  createTask({ id, name, title, goal, criteria = [], kind = 'code', destination: intent, chiefDirectory }) {
     if (!TASK_KINDS.includes(kind)) throw new ProcessError('invalid_input', `kind must be one of ${TASK_KINDS.join(', ')}.`);
     const t = {
       id,
       ...(name ? { name } : {}),
       kind,
+      ...(intent ? { destination: destination(intent) } : {}),
+      ...(chiefDirectory ? { chiefDirectory } : {}),
       owner: this.selfId,
       lead: null,
       members: {},
@@ -539,6 +544,7 @@ export class ProcessEngine {
     this.claimingFrom.set(id, t.owner);
     t.owner = this.selfId;
     t.lead = { sessionId: this.selfId, claimedAt: now(), token };
+    delete t.workspaceRepair;
     this.changed(t, previous ? 'A new engineer took over.' : 'Engineer started.');
     return t;
   }
@@ -551,6 +557,11 @@ export class ProcessEngine {
       task.decisionsApplied = d.seq;
       try {
         this.humanDecision({ taskId: task.id, action: d.action, note: d.note ?? '', ship: typeof d.ship === 'boolean' ? d.ship : undefined });
+        if (d.workspaceRepair && d.seq > (task.repairInvalidatedThrough ?? 0)
+          && d.workspaceRepair.sessionId === this.selfId && ['retry', 'note'].includes(d.action)) {
+          task.workspaceRepair = { ...d.workspaceRepair, seq: d.seq };
+          this.changed(task, 'The human authorized workspace repair; immediate host confirmation is still required.');
+        }
         applied.push(d);
       } catch (err) {
         if (!(err instanceof ProcessError)) throw err;
@@ -673,6 +684,7 @@ export class ProcessEngine {
   // The engineer hands the result to the human (through the Chief). Steps not started are skipped.
   deliver(taskId, summary, { decisions = [], ship, ask = '' } = {}) {
     const t = this.task(taskId);
+    this.requirePlacement(t);
     if (t.stage !== 'routing') throw new ProcessError('invalid_state', `${taskId} is "${stageLabel(t)}"; deliver once the current step is done.`);
     // Shipping: the human already approved. Delivering hands back to watching the PR.
     if (t.ship?.pr && SHIP_ACTIVE.has(t.ship.phase)) {
@@ -710,6 +722,7 @@ export class ProcessEngine {
   // anything is recorded, so a bad submission comes straight back as an error saying what to fix.
   async submit(taskId, stepId, raw) {
     const task = this.task(taskId);
+    this.requirePlacement(task);
     const step = currentStep(task);
     if (!step || task.stage !== 'working') {
       throw new ProcessError('invalid_state', `${taskId} is "${stageLabel(task)}"; there's no step to submit right now. Call grove_next.`);
@@ -718,6 +731,10 @@ export class ProcessEngine {
     const text = String(raw ?? '').trim();
     const checked = await this.checkStep(task, step, text);
     if (!checked.ok) throw new ProcessError('invalid_output', checked.reason);
+    if (task.destination && step.reviewers.some((r) => r.worktree)) {
+      if (!task.placement.repository) throw new ProcessError('invalid_state', 'Separate reviewers require a repository attachment.');
+      step.snapshot = ['execute', 'verify'].includes(step.kind) ? await committedSnapshot(task.placement.directory) : null;
+    }
     this.recordStepOutput(task, step, text, checked);
     return { task, step };
   }
@@ -758,9 +775,12 @@ export class ProcessEngine {
 
   issue(task, { specialty, step, round = 0 }) {
     const n = ++task.seq;
+    const submission = task.steps.find((s) => s.id === step);
+    const worktree = submission?.reviewers.find((r) => r.name === specialty)?.worktree === true;
     const ticket = {
       id: `${task.id}-rev-${specialty}-${n}`,
       role: 'reviewer', specialty, step, round,
+      worktree, snapshot: worktree ? submission?.snapshot ?? null : null, version: submission?.version ?? 0,
       forum: step,
       agentType: AGENT_TYPES.reviewer(specialty),
       status: 'issued',
@@ -787,7 +807,8 @@ export class ProcessEngine {
   // transcript), or start a new session when that specialty has none yet or its session was lost.
   route(task, ticket) {
     const m = this.member(task, ticket);
-    return m?.link && m.status !== 'lost' ? { tool: 'send_message', session: m.link } : { tool: 'create_session' };
+    return m?.link && m.status !== 'lost' && !!m.worktree === !!ticket.worktree
+      ? { tool: 'send_message', session: m.link } : { tool: 'create_session' };
   }
 
   // Called before create_session / send_message runs. Returns { task, ticket } or throws ProcessError.
@@ -795,6 +816,7 @@ export class ProcessEngine {
     const found = this.findTicket(marker);
     if (!found) throw new ProcessError('unknown_ticket', `Ticket ${marker} does not exist. Call grove_next for valid hires.`);
     const { task, ticket } = found;
+    this.requirePlacement(task);
     if (!this.owns(task)) throw new ProcessError('not_owner', `Ticket ${marker} belongs to another task's engineer.`);
     if (TERMINAL.has(task.stage)) throw new ProcessError('invalid_state', `${task.id} is ${task.stage}; this hire is no longer needed.`);
     if (ticket.status !== 'issued') throw new ProcessError('ticket_used', `Ticket ${marker} is ${ticket.status}. Call grove_next for current hires.`);
@@ -802,6 +824,7 @@ export class ProcessEngine {
     if (tool === 'send_message') {
       const m = this.member(task, ticket);
       if (!m?.link) throw new ProcessError('wrong_route', `Ticket ${marker} needs a new session: use create_session.`);
+      if (!!m.worktree !== !!ticket.worktree) throw new ProcessError('wrong_route', 'Reviewer isolation changed; create a compatible new reviewer.');
       if (target && !sameChat(target, m.link)) throw new ProcessError('wrong_route', `Ticket ${marker} goes to the ${memberTitle(ticket)} session ${m.link}.`);
     } else if (route.tool === 'send_message') {
       // Starting a fresh session for a role that has one is allowed (for example if its chat was closed).
@@ -820,7 +843,7 @@ export class ProcessEngine {
 
   rememberMember(task, ticket, link) {
     this.learnLeadLink(task, link);
-    task.members[ticket.member] = { ...(task.members[ticket.member] ?? {}), key: ticket.member, title: memberTitle(ticket), role: ticket.role, specialty: ticket.specialty, link, status: 'alive', since: now() };
+    task.members[ticket.member] = { ...(task.members[ticket.member] ?? {}), key: ticket.member, title: memberTitle(ticket), role: ticket.role, specialty: ticket.specialty, worktree: !!ticket.worktree, link, status: 'alive', since: now() };
     ticket.link = link;
   }
 
@@ -870,6 +893,7 @@ export class ProcessEngine {
     if (m && result.sessionId) m.sessionId = result.sessionId;
     if (m) { m.status = 'alive'; m.seenAt = now(); }
     if (result.status === 'running') {
+      ticket.placement = result.placement;
       if (ticket.status === 'running' && ticket.heartbeatAt === result.heartbeat) return false;
       const first = ticket.status !== 'running';
       ticket.status = 'running';
@@ -891,6 +915,11 @@ export class ProcessEngine {
       return true;
     }
     if (result.status === 'done') {
+      if (task.destination && (result.submissionVersion !== ticket.version
+        || task.steps.find((s) => s.id === ticket.step)?.version !== ticket.version)) {
+        this.failTicket(task, ticket, 'Reviewer submission version is mismatched; report rejected.');
+        return true;
+      }
       const checked = await this.checkOutput(task, ticket, result.text);
       if (!checked.ok) {
         this.failTicket(task, ticket, `report rejected: ${checked.reason}`);
@@ -898,6 +927,13 @@ export class ProcessEngine {
       }
       if (checked.blocked) {
         this.blockOn(task, ticket, checked.blocked, String(result.text ?? ''));
+        return true;
+      }
+      const placement = task.destination && ticket.worktree && result.placement?.status === 'verified'
+        ? await observePlacement(task, result.placement.directory, { reviewer: ticket, sessionId: result.sessionId })
+        : result.placement;
+      if (!reviewerMatches(task, ticket, placement)) {
+        this.failTicket(task, ticket, 'Reviewer attachment/revision is unknown or mismatched; report rejected.');
         return true;
       }
       this.acceptReview(task, ticket, String(result.text ?? '').trim());
@@ -910,6 +946,12 @@ export class ProcessEngine {
     this.completeTicket(ticket);
     const step = task.steps.find((s) => s.id === ticket.step);
     if (step) this.recordReview(task, step, ticket, text, parseVerdict(text));
+  }
+
+  requirePlacement(task) {
+    if (task.destination && task.placement?.status !== 'verified') {
+      throw new ProcessError('invalid_state', task.placement?.error ?? 'Actual attachment is unknown; inspect placement before working.');
+    }
   }
 
   // Fail hires whose session never picked them up or stopped reporting. Owner only; called on each poll.

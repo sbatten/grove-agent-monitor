@@ -25,13 +25,56 @@ earlier rounds. **One session = one sprite** in the grove.
 
 In VS Code's session list, **each task is grouped under its engineer**:
 - **Engineers:** the Chief starts each engineer as an independent top-level
-  session in the Chief's workspace (`relationship: "independent"`).
+  session at its structured task destination (`relationship: "independent"`).
 - **Reviewers:** nested chats inside their engineer's session
   (`relationship: "currentSession"`), so a task's whole team sits together.
 - **Enforcement:** Grove's `preToolUse` hook sets this placement (and the
   model) on every `create_session` call, so it doesn't depend on the model
-  passing the right arguments. A different workspace the Chief chose for an
-  engineer is kept.
+  passing the right arguments. Destination is authoritative, not the Chief's
+  cwd or a path mentioned in the goal.
+
+### Workspace routing
+
+Every new `grove_create_task` requires `destination`:
+
+| Mode | Workspace | Creation intent |
+| --- | --- | --- |
+| `new-worktree` | Absolute target repo | `worktree: true` |
+| `existing-worktree` | Exact authorized continuation checkout | Direct folder; verify actual attachment |
+| `read-only` | Absolute Git checkout folder | Direct folder; no new worktree needed |
+| `scratch` | Omitted | Omit workspace/worktree; independent host scratch |
+
+Actual directory, Git identity, branch and HEAD are recorded separately.
+Unknown or mismatched attachment blocks work and review acceptance. Resume a
+correctly attached engineer for same-PR work; recovery carries its verified
+checkout, never defaults to main. Some hosts redirect independent
+`worktree: false` from a linked checkout to the primary root. That is a repair
+prerequisite, not successful reuse. Legacy boards retain reports/votes and active
+attachments; legacy recovery needs an explicit `grove_handoff` destination.
+`read-only` requires Git identity; non-repository work uses `scratch`.
+Ordinary branch changes or detached HEAD inside the verified engineer checkout
+remain allowed. Identity is refreshed at submission/dispatch and on directory
+changes, not reprobed or rewritten for every ordinary tool call.
+
+Reviewers share the engineer folder by default. A reviewer object
+`{ name: "code", worktree: true }` opts into a separate nested worktree on
+supporting hosts. Code review requires committed content and a pinned SHA.
+The host may start on the default branch: Grove selects the pinned commit only
+in the clean separate checkout (detached, hooks disabled), then checks actual
+HEAD and cleanliness before work and again before accepting the review.
+Preparation failures survive reviewer restart until a fresh assignment.
+Dirty content or unsupported placement is
+reported, never auto-committed or silently converted to sharing.
+
+Only a Chief-recorded explicit human `workspaceRepair: true` decision (`retry` or
+`note`) permits attachment-repair confirmation. Target/isolation derive from
+recorded routing, not free text. The affirmative form must immediately precede
+matching `set_workspace`, as the turn's final tool. Host confirmation/approval
+still applies. A placement failure does not authorize repair; ordinary questions
+and other attachment/move tools remain denied. Correct attachments and read-only
+diagnosis need no form.
+Restart invalidates both repair authority and consent: a fresh Chief-recorded
+human decision is required, including when the session identity is unchanged.
 
 ### Steps: the engineer shapes the work
 
@@ -581,7 +624,7 @@ skills/grove-sprites/
 
 | Tool | Who | Description |
 | --- | --- | --- |
-| `grove_create_task` | Chief | Open a task `{ title, goal, kind, criteria? }`, where `kind` is `code`, `research` or `other`. It returns a `handoff` `{ title, prompt, relationship: "independent", model, workspace }` to pass to `create_session`. |
+| `grove_create_task` | Chief | Open a task `{ title, goal, kind, destination, criteria? }`. Pass the exact returned handoff to `create_session`; workspace/worktree are omitted for scratch. |
 | `grove_handoff` | Chief | Get a fresh hand-off for a task whose engineer never started, stalled or was lost. The new engineer picks the task up from the board. |
 | `grove_record_decision` | Chief | Record what the human decided, asked or said: `approve` (`ship: false` to skip the PR), `changes`, `note`, `question`, `hold`, `resume`, `retry`, `merge` or `cancel`, with their words as `note`. Grove checks it applies to the task's stage. It returns the message to send the engineer. |
 | `grove_cancel_task` | Chief | Cancel a task. |
@@ -636,6 +679,7 @@ Writes are atomic, and each file includes a format marker and version.
 ```sh
 node tests/process.test.mjs                              # process engine, roles, relays (simulated sessions)
 node tests/engine.test.mjs                               # engine alone: hold, blockers, questions, shipping, limits
+node tests/placement.test.mjs                            # routing, Git identity, reviewer revisions, consent (temporary fixtures)
 node tests/agents.test.mjs                               # agent front matter is valid
 node tests/scene.test.mjs                                # team tents: pitch, rest inside, strike
 node tests/report.test.mjs                               # task report, report/evidence/inbox routes

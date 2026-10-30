@@ -12,6 +12,19 @@ import { fileURLToPath } from 'node:url';
 import { MAX_ROUNDS, memberTitle, stepLabel, stageLabel, KIND_LABELS, KIND_SKILLS, TEMPLATES, REVIEWER_FOCUS, ENGINEER_AGENT, prLine, currentStep } from './engine.mjs';
 import { memberModel } from './models.mjs';
 import { taskLabel, taskTag } from './names.mjs';
+import { reviewerPlacement, confirmationForm } from './placement.mjs';
+
+function placementBrief(task, ticket) {
+  if (!task.destination) return '\n## Workspace\nLegacy task: retain the current attachment; recovery needs an explicit structured destination.\n';
+  if (ticket) return `\n## Workspace and revision\n${ticket.worktree ? 'Separate worktree explicitly requested. Grove prepares a clean detached checkout of the pinned commit, when present; host default branch is not revision proof.' : 'Share the engineer attachment; do not create another worktree.'}
+Expected engineer directory: ${task.placement?.directory ?? 'unknown'}.
+${ticket.snapshot ? `Pinned submission v${ticket.version}: ${ticket.snapshot}. Actual reviewer HEAD must match before review and verdict acceptance.` : 'No isolated code snapshot is required for this ticket.'}
+Per-chat hook cwd is authoritative; session-level metadata is not proof. Unknown/mismatched placement blocks work. Do not modify code or repair attachment yourself.\n`;
+  return `\n## Workspace\nStructured destination: ${JSON.stringify(task.destination)}.
+Actual attachment: ${JSON.stringify(task.placement ?? { status: 'unknown' })}.
+Never infer destinations from prose, shell cd, or the Chief's scratch directory. New repository tasks use managed isolation; continuation uses the exact verified existing checkout. Independent creation with worktree:false may redirect an existing worktree to its primary root: verify actual placement, never silently work there.
+${task.workspaceRepair ? `The human authorized this owner's repair. Use ask_user with message "Confirm the authorized workspace repair." and requestedSchema.properties.workspaceConfirmation=${JSON.stringify(confirmationForm(task.workspaceRepair.target))}. Only an affirmative response permits set_workspace with ${JSON.stringify(task.workspaceRepair.target)} as the immediately next and final tool call. Host confirmation/approval still applies.` : 'Do not change attachment. If repair is needed, block and have the Chief record an explicit human workspaceRepair decision; a placement failure is not authorization.'}\n`;
+}
 
 // Standing instructions live in the plugin's agent files and skills. Sessions aren't started as custom
 // agents (create_session can't pick one), so Grove puts the instructions in each brief.
@@ -108,6 +121,7 @@ ${task.goal}
 
 ## Acceptance criteria
 ${criteriaBlock(task)}
+${placementBrief(task, ticket)}
 `;
   if (!step) return head + BLOCKED_CLAUSE;
   const f = step.forum;
@@ -181,6 +195,7 @@ ${task.goal}
 
 ## Acceptance criteria
 ${criteriaBlock(task)}
+${placementBrief(task)}
 
 ## Steps
 Each step is one of four kinds, and any step can have reviewers:
@@ -227,7 +242,7 @@ Allowed files: .png .jpg .jpeg .gif .webp .svg .mp4 .webm (at least one image or
   }
   return `## Your step: ${stepLabel(step)}
 ${step.ship ? '' : `Load the \`${skill}\` skill now, even if you loaded it earlier: it has the instructions for this kind of step.\n\n`}${step.brief || 'Do what this kind of step calls for, guided by the goal.'}
-${redoOf ? `\nThis step re-runs ${redoOf.id}, whose result needs another pass. Use the feedback below.\n` : ''}${revising ? `
+${placementBrief(task)}${redoOf ? `\nThis step re-runs ${redoOf.id}, whose result needs another pass. Use the feedback below.\n` : ''}${revising ? `
 ## Revising v${step.version}
 The reviewers asked for changes. Address every blocking point, and argue any you disagree with. Your output must change: resubmitting the same text escalates the step to the human.
 
@@ -381,5 +396,6 @@ export function hireInstruction(task, ticket, { boardId, route }) {
   const base = { ticket: ticket.id, task: task.id, role, attempt: ticket.attempt };
   if (route.tool === 'send_message') return { ...base, tool: 'send_message', session: route.session, message: text };
   const model = memberModel(task, ticket);
-  return { ...base, tool: 'create_session', title: `${taskTag(task)} · ${memberTitle(ticket)}`, prompt: text, relationship: 'currentSession', ...(model ? { model } : {}) };
+  return { ...base, tool: 'create_session', title: `${taskTag(task)} · ${memberTitle(ticket)}`, prompt: text,
+    relationship: 'currentSession', ...reviewerPlacement(task, ticket), ...(model ? { model } : {}) };
 }
