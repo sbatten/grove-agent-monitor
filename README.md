@@ -576,6 +576,21 @@ The canvas shows the team at work. Your **inbox** lives on the Chief of Staff:
 
 ## Using it
 
+### Install in VS Code
+
+1. Open the **Agent Customizations** editor and select **Plugins**.
+2. Select the add (`+`) button next to **User** or **Workspace**, then install
+   from `https://github.com/sbatten/grove-agent-monitor` or choose this local
+   repository folder.
+3. Use the **Copilot** agent harness with SDK extension and canvas support.
+   The plugin needs the VS Code agent host's session tools.
+
+The manifest at `.plugin/plugin.json` uses VS Code's supported OpenPlugin
+format. Its component paths are relative to the repository root and register
+the bundled agents, skills, and SDK extension together.
+
+### Start a task
+
 1. Install the plugin, then start a **new** chat with the **Chief of Staff**
    agent selected. The host must provide the session tools `create_session`
    and friends (the VS Code agent host does).
@@ -680,7 +695,7 @@ Writes are atomic, and each file includes a format marker and version.
 node tests/process.test.mjs                              # process engine, roles, relays (simulated sessions)
 node tests/engine.test.mjs                               # engine alone: hold, blockers, questions, shipping, limits
 node tests/placement.test.mjs                            # routing, Git identity, reviewer revisions, consent (temporary fixtures)
-node tests/agents.test.mjs                               # agent front matter is valid
+node tests/agents.test.mjs                               # plugin manifest, component paths, agent/skill front matter
 node tests/scene.test.mjs                                # team tents: pitch, rest inside, strike
 node tests/report.test.mjs                               # task report, report/evidence/inbox routes
 node skills/grove-sprites/scripts/validate-sprites.mjs   # lint sprites

@@ -1,0 +1,9 @@
+{
+  "name": "grove-agent-monitor",
+  "version": "0.19.0",
+  "description": "Chief of Staff orchestration with an independent engineer session per task, phase skills, unanimous reviews, and a live pixel-art forest canvas.",
+  "repository": "https://github.com/sbatten/grove-agent-monitor",
+  "agents": "agents/",
+  "skills": "skills/",
+  "extensions": "extensions/"
+}
