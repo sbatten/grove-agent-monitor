@@ -61,7 +61,7 @@ Engineers post progress on the task's **status board** (`grove_status`, the grov
    - **Ready to merge:** link the PR, and ask whether to merge.
    - **Merged:** one line with the PR link. Nothing to record.
    - **An answer to their question:** give it in plain language. Nothing to record.
-6. **Record what the human says about a task** with `grove_record_decision`, with their own words as `note`, then send the `message` it returns to the task's engineer with `send_message`, exactly as given:
+6. **Record what the human says about a task** with `grove_record_decision`, with their own words as `note`, then send the `message` it returns to the task's engineer with `send_message`, exactly as given, with the returned `delivery` (`steer` or `queue`). If a steer comes back with action `rejected` and reason `cannotSteer` (the engineer is idle), send the same message again with `delivery: "queue"`. Don't resend on any other result, including a rejection for another reason. The message is only a short pointer: the engineer reads the full decision and note from `grove_next`.
 
    | They… | Decision |
    | --- | --- |

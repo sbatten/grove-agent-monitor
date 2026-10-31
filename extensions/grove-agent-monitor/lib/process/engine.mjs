@@ -409,6 +409,16 @@ export class ProcessEngine {
     return null;
   }
 
+  // Whether a reviewer's report for this ticket is old news: not this task's, or already recorded for a step
+  // or round that's no longer under review.
+  staleTicket(task, ticketId) {
+    const k = task.tickets.find((x) => x.id === ticketId);
+    if (!k) return true;
+    if (k.status !== 'done') return false;
+    const step = currentStep(task);
+    return !step || k.step !== step.id || k.round !== step.forum?.round;
+  }
+
   evidenceDir(task, attempt) {
     return path.join(this.root, task.id, 'evidence', `attempt-${attempt}`);
   }
@@ -507,6 +517,7 @@ export class ProcessEngine {
       lead: null,
       members: {},
       decisionsApplied: 0,
+      consumedDecisionSeq: 0,
       title: clip(title, 80),
       goal: clip(goal, 4000),
       criteria: criteria.map((c) => clip(c, 300)).filter(Boolean).slice(0, 20),
