@@ -169,7 +169,7 @@ for (const k of ['hire', 'notice', 'resend']) assert.equal(relayDelivery(k), 'qu
   // The read cursor moves: the next call doesn't show it again.
   assert.deepEqual((await eng.call('grove_next')).data.decisions, []);
   // Replaying the consumed relay doesn't act again, and still points at grove_next.
-  assert.match(await eng.proc.onRelay('decision', /\/(T1:\d+)\]/.exec(msg)[1]), /Call grove_next now/);
+  assert.match(await eng.proc.onRelay('decision', /\/(T1:\d+)\]/.exec(msg)[1]), /already applied .*call grove_next if you haven't since/);
   assert.deepEqual((await eng.call('grove_next')).data.decisions, []);
 }
 
