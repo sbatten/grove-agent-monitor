@@ -738,6 +738,11 @@ assert.equal((await chief.proc.board.readDecisions('T6')).length, 1, 'one decisi
 assert.equal(chief.proc.inboxLog.filter((x) => x.taskId === 'T6').length, 1, 'logged once');
 // After a restart the inbox log is gone; the board still knows it.
 assert.equal((await chief.proc.inboxDecide('T6', 'complete')).duplicate, true, 'an identical click later is still a duplicate');
+// Chat decisions are deliberate: a repeat is appended even when the caller's appliedThrough lags the owner.
+for (let i = 0; i < 2; i++) {
+  assert.equal((await chief.proc.board.appendDecision('TDEDUPE', { action: 'note', note: 'Again.', via: 'chat' })).duplicate, false, 'chat repeat is not deduped');
+}
+assert.equal((await chief.proc.board.readDecisions('TDEDUPE')).length, 2);
 assert.deepEqual(chief.proc.liveView().process.inbox.items.find((x) => x.taskId === 'T6')?.decision ?? chief.proc.decisionView('T6'), { seq: 1, action: 'approve', state: 'recorded' });
 // The engineer's chat has gone away: it never applies that. The human dismisses the task instead.
 eng6.proc.dispose();
@@ -780,6 +785,11 @@ const pA = (await chief.call('grove_handoff', { taskId: 'T6' })).data.handoff.pr
 assert.equal(chief.proc.decisionView('T6').state, 'awaiting-engineer');
 assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T6')).link, null, 'the old chat is no longer a route');
 const pB = (await chief.call('grove_handoff', { taskId: 'T6' })).data.handoff.prompt;
+// A relay the Chief queued before the hand-off still names the old chat: it is refused, and isn't an attempt.
+back = await send(chief, rel.session, rel.message);
+assert.match(back.denied ?? '', /T6 has no engineer to reach right now.*relays decision #2 once the new engineer starts/s);
+await settle(chief);
+assert.deepEqual([chief.proc.decisionView('T6').state, chief.proc.board.meta.decisionRelays.T6.attempts], ['awaiting-engineer', 0], 'the new generation starts with no attempts, and the refused send adds none');
 started(chief, { link: 'agent-host-session://ahp-session/G-ghost' }, pA);
 await settle(chief);
 assert.equal(chief.proc.board.meta.leadRoutes?.T6, undefined, 'a superseded hand-off never becomes a route');
@@ -792,10 +802,23 @@ assert.deepEqual([res.data.tasks[0].engineer.route, res.data.tasks[0].engineer.h
 const eng6b = await startSession('eng-6b');
 started(chief, eng6b, pB);
 await settle(chief);
+// Every write of T6 is whole: the decision outcomes, the applied cursor and the stage land together.
+const saves6 = [];
+const { Board } = await import('../extensions/grove-agent-monitor/lib/process/board.mjs');
+const realSave = Board.prototype.saveTask;
+Board.prototype.saveTask = function (task, ...rest) { if (task.id === 'T6') saves6.push(structuredClone(task)); return realSave.call(this, task, ...rest); };
 await eng6b.hooks.onUserPromptSubmitted({ prompt: pB });
 await sync(eng6b, chief);
 const t6 = eng6b.proc.engine.task('T6');
 assert.equal(t6.stage, 'cancelled', 'the dismiss wins; the complete never runs');
+Board.prototype.saveTask = realSave;
+assert.ok(saves6.some((x) => x.stage === 'cancelled'));
+for (const x of saves6) {
+  assert.equal((x.decisionResults ?? []).length, x.decisionsApplied ?? 0, 'outcomes and cursor saved together');
+  if ((x.decisionsApplied ?? 0) > 0) assert.equal(x.stage, 'cancelled', 'cursor and stage saved together');
+}
+const disk6 = (await chief.proc.board.readTasks()).find((x) => x.id === 'T6');
+assert.deepEqual([disk6.stage, disk6.decisionsApplied, disk6.decisionResults.map((x) => x.result)], ['cancelled', 2, ['superseded', 'applied']], 'reopened from disk');
 assert.deepEqual(t6.decisionResults.map((x) => [x.seq, x.action, x.result]), [[1, 'approve', 'superseded'], [2, 'cancel', 'applied']]);
 await relayTick();
 assert.deepEqual(chief.proc.decisionView('T6'), { seq: 2, action: 'cancel', state: 'applied' });
@@ -866,8 +889,19 @@ chiefSend(rel7, false, chief2);
 await settle(chief2);
 r7d = chief2.proc.board.meta.decisionRelays.T7;
 assert.deepEqual([r7d.state, r7d.attempts], ['delivery-failed', 1]);
-// The retry reaches the engineer, which applies it.
+// A send queued for a chat that no longer holds T7 is refused, and Grove re-targets at once (no backoff).
 await tick2();
+const stale7 = relayOf(chief2.sent.at(-1)).message;
+back = await send(chief2, 'agent-host-session://ahp-session/G-eng-old', stale7);
+assert.match(back.denied ?? '', new RegExp(`no longer T7's engineer.*\\(${eng7.link}\\) itself`, 's'));
+await settle(chief2);
+assert.equal(chief2.proc.board.meta.decisionRelays.T7.attempts, 1, 'a refused send is not an attempt');
+const asked7 = chief2.sent.length;
+await chief2.proc.relayToChief();
+await settle(chief2);
+assert.equal(chief2.sent.length, asked7 + 1, 're-requested without waiting for the backoff');
+// The retry reaches the engineer, which applies it.
+assert.equal(relayOf(chief2.sent.at(-1)).session, eng7.link);
 back = await send(chief2, eng7.link, relayOf(chief2.sent.at(-1)).message);
 await settle(chief2);
 assert.equal(chief2.proc.board.meta.decisionRelays.T7.attempts, 2);
@@ -875,6 +909,9 @@ await sync(eng7, chief2);
 assert.equal(eng7.proc.engine.task('T7').decisionsApplied, 1);
 await tick2();
 assert.deepEqual(chief2.proc.decisionView('T7'), { seq: 1, action: 'note', state: 'applied', attempts: 2 });
+// Sending it again once it's applied is refused.
+back = await send(chief2, eng7.link, stale7);
+assert.match(back.denied ?? '', /decision #1 for T7 is already applied; don't send it again/);
 assert.ok(!chief2.sent.some((m) => /grove_handoff for T7/.test(m)));
 
 // 17. A board from the earlier process (a task lead with persona sessions) isn't migrated: Grove leaves it

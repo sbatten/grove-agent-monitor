@@ -632,6 +632,39 @@ export class GroveProcess {
     return (await this.currentLeadLink(taskId)).link;
   }
 
+  // Chief: a decision relay is checked again right before it goes out. An instruction queued earlier may
+  // name an engineer a newer hand-off has since replaced; that send is refused, and Grove re-sends to the
+  // current engineer once there is one.
+  async gateRelaySend(args) {
+    const r = RELAY_MARKER.exec(String(args?.message ?? ''));
+    const ref = r?.[1] === 'decision' && r[2] === this.board.id ? DECISION_REF.exec(r[3]) : null;
+    if (!ref) return undefined;
+    const [, taskId] = ref;
+    const seq = Number(ref[2]);
+    await this.engine.refresh();
+    const relay = this.board.meta.decisionRelays?.[taskId];
+    if (relay && relay.seq === seq && RELAY_FINAL.has(relay.state)) {
+      return deny(`Grove: decision #${seq} for ${taskId} is already ${relay.state}; don't send it again.`);
+    }
+    const task = this.engine.state.tasks.find((x) => x.id === taskId);
+    if (!task) return undefined;
+    const { link } = this.leadRoute(task);
+    const target = String(args?.session ?? '').split('?')[0];
+    if (link && link === target) return undefined;
+    // Re-target now rather than after the backoff: the next tick asks the Chief again with the current link.
+    if (relay && relay.seq === seq && link) {
+      await this.board.updateMeta((meta) => {
+        const cur = meta.decisionRelays?.[taskId];
+        if (!cur || cur.seq !== seq || RELAY_FINAL.has(cur.state)) return false;
+        cur.nextAt = this.now();
+        return true;
+      }).catch((err) => this.log(`Grove could not re-target a decision relay: ${err.message}`, 'warning'));
+    }
+    return deny(link
+      ? `Grove: ${target || 'that chat'} is no longer ${taskId}'s engineer. Don't send this; Grove relays decision #${seq} to the current engineer (${link}) itself.`
+      : `Grove: ${taskId} has no engineer to reach right now (a newer hand-off hasn't been claimed). Don't send this; Grove relays decision #${seq} once the new engineer starts.`);
+  }
+
   // The current engineer's chat for a task, with fresh board state. Only the Chief writes the meta, so its
   // own copy is current; other sessions reload it.
   async currentLeadLink(taskId) {
@@ -958,6 +991,9 @@ export class GroveProcess {
       const relay = meta.decisionRelays?.[call.taskId];
       if (!relay || RELAY_FINAL.has(relay.state)) return false;
       if (relay.seq !== call.seq || relay.generation !== call.generation || relay.attempt !== call.attempt || relay.sentAttempt === call.attempt) return false;
+      // A send to a chat that is no longer the engineer's is refused before it runs; it isn't an attempt.
+      const t = this.engine.state.tasks.find((x) => x.id === call.taskId);
+      if (!t || this.leadRoute(t, meta).link !== call.target) return false;
       relay.attempts = (relay.attempts ?? 0) + 1;
       relay.sentAttempt = call.attempt;
       return true;
@@ -1398,6 +1434,7 @@ export class GroveProcess {
               throw err;
             }
           }
+          if (name === 'send_message') return this.gateRelaySend(args);
           return undefined;
         }
         if (this.role === 'member') {

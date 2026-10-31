@@ -362,7 +362,9 @@ export class ProcessEngine {
     }
     if (task) {
       task.updatedAt = now();
-      if (this.owns(task)) {
+      // During a decision batch the task is saved once, when the batch ends.
+      if (this.holding?.has(task.id)) {}
+      else if (this.owns(task)) {
         const from = this.claimingFrom.get(task.id);
         this.board.saveTask(task, from ?? this.selfId).then(() => {
           if (from !== undefined && this.claimingFrom.get(task.id) === from) this.claimingFrom.delete(task.id);
@@ -558,6 +560,24 @@ export class ProcessEngine {
     const applied = [];
     const pending = items.filter((d) => d.seq > (task.decisionsApplied ?? 0)).sort((a, b) => a.seq - b.seq);
     const cancelAt = pending.find((d) => d.action === 'cancel')?.seq;
+    if (!pending.length) return applied;
+    // The transitions, the cursor and each outcome are saved together in one snapshot, so a restart never
+    // finds a decision counted as applied without its outcome.
+    this.holding ??= new Set();
+    const outer = this.holding.has(task.id);
+    if (!outer) this.holding.add(task.id);
+    try {
+      this.applyPending(task, pending, cancelAt, applied);
+    } finally {
+      if (!outer) {
+        this.holding.delete(task.id);
+        this.changed(task, null);
+      }
+    }
+    return applied;
+  }
+
+  applyPending(task, pending, cancelAt, applied) {
     for (const d of pending) {
       task.decisionsApplied = d.seq;
       if (cancelAt !== undefined && d.seq < cancelAt && !['note', 'question'].includes(d.action)) {
@@ -580,7 +600,6 @@ export class ProcessEngine {
         this.changed(task, `Decision "${d.action}" not applied: ${err.message}`);
       }
     }
-    return applied;
   }
 
   noteDecision(task, d, result, reason, by) {

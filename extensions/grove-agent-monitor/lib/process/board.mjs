@@ -320,14 +320,16 @@ export class Board {
 
   // Chief only: append the human's decision for the task's owner to apply.
   // `via` is 'grove' when the human decided in the canvas inbox rather than in the Chief's chat.
-  // Read, dedupe and write run as one queued job, so two clicks can't both read the same last seq. A decision
-  // identical to one still waiting to be applied (seq > appliedThrough) isn't appended twice.
+  // Read, dedupe and write run as one queued job, so two clicks can't both read the same last seq. An inbox
+  // click identical to one still waiting to be applied (seq > appliedThrough) isn't appended twice. Chat
+  // decisions and workspace-repair grants are deliberate and always appended: the caller's appliedThrough can
+  // lag the owner's save, so deduping them could silently drop a repeated, already-applied decision.
   appendDecision(taskId, { action, note, via = 'chat', ship, workspaceRepair }, { appliedThrough = 0 } = {}) {
     return this.queue(async () => {
       const items = await this.readDecisions(taskId);
-      const same = items.find((d) => d.seq > appliedThrough && d.action === action && (d.via ?? 'chat') === via
-        && (d.note ?? null) === (note ?? null) && d.ship === ship
-        && JSON.stringify(d.workspaceRepair ?? null) === JSON.stringify(workspaceRepair ?? null));
+      const same = via === 'grove' && !workspaceRepair && items.find((d) => d.seq > appliedThrough
+        && d.action === action && d.via === via && (d.note ?? null) === (note ?? null) && d.ship === ship
+        && !d.workspaceRepair);
       if (same) return { item: same, duplicate: true };
       const item = { seq: (items.at(-1)?.seq ?? 0) + 1, action, note, via, at: Date.now(),
         ...(ship !== undefined ? { ship } : {}), ...(workspaceRepair ? { workspaceRepair } : {}) };
