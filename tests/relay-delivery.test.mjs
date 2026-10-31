@@ -512,5 +512,50 @@ const hooked = (eng) => async (m) => (await eng.hooks.onUserPromptSubmitted({ pr
   assert.match(engineerWake(task(), []), /grove_next/);
 }
 
+// 16. The host keeps one steering slot: a pointer to something Grove doesn't have (an unknown report or decision
+//     seq) can replace a real hold's steer. Its reply must not say "carry on" while the hold is still unread.
+for (const kind of ['report', 'decision']) {
+  const { chief, eng, task } = await setup();
+  const boardId = chief.proc.board.id;
+  const host = new RelayHost();
+  host.add(eng.link, async (m) => (await eng.hooks.onUserPromptSubmitted({ prompt: m, sessionId: eng.id }))?.additionalContext, { active: true });
+  const hold = await chief.call('grove_record_decision', { taskId: 'T1', decision: 'hold', note: 'Stop: the API is changing.' });
+  assert.equal(hold.data.delivery, 'steer');
+  await host.relay({ session: eng.link, message: hold.data.message.message, delivery: 'steer' });
+  const bogus = kind === 'report'
+    ? `[grove-report:${boardId}/T1-plan-tests-99] Tests reviewer finished T1-plan-tests-99. Call grove_next now.`
+    : `[grove-decision:${boardId}/T1:999999] The human decided. Call grove_next now.`;
+  await host.relay({ session: eng.link, message: bogus, delivery: 'steer' });
+  assert.ok(host.trace.some((e) => e.event === 'steer-replaced'), 'the unknown pointer replaced the hold\'s steer');
+  const ctx = await host.boundary(eng.link, 'edit');
+  assert.equal(host.chats.get(eng.link).seen.length, 1, 'only the unknown pointer was delivered');
+  assert.doesNotMatch(ctx, /Carry on/, `${kind}: no "carry on" while the hold is unread`);
+  assert.match(ctx, /other news is waiting for you\. Call grove_next now/);
+  host.log('grove-next', eng.link);
+  const next = await eng.call('grove_next');
+  assert.equal(next.data.decisions.at(-1).action, 'hold', 'the receiver retrieves the hold before further work');
+  assert.equal(next.data.decisions.at(-1).note, 'Stop: the API is changing.');
+  assert.equal(task().stage, 'on-hold');
+  host.log('engineer-next-action', eng.link);
+  const at = (ev) => host.trace.findIndex((e) => e.event === ev);
+  assert.ok(at('delivered') < at('grove-next') && at('grove-next') < at('engineer-next-action'), JSON.stringify(host.trace));
+  // Once it's read, the same unknown pointer is nothing new again.
+  const ref = kind === 'report' ? 'T1-plan-tests-99' : 'T1:999999';
+  assert.match(await eng.proc.onRelay(kind, ref), /nothing new\. Carry on/);
+}
+
+// 17. An unknown report pointer while a collected round result hasn't been seen also points at grove_next.
+{
+  const { eng } = await setup();
+  eng.proc.unseenReports.add('T1-plan-code-1');
+  assert.match(await eng.proc.onRelay('report', 'T1-plan-tests-99'), /no reviewer report T1-plan-tests-99 for T1, but other news is waiting/);
+  eng.proc.unseenReports.clear();
+  // And an unreadable board is treated as unread.
+  const read = eng.proc.board.readDecisions.bind(eng.proc.board);
+  eng.proc.board.readDecisions = async () => { throw new Error('EIO'); };
+  assert.match(await eng.proc.onRelay('report', 'T1-plan-tests-99'), /other news is waiting/);
+  eng.proc.board.readDecisions = read;
+}
+
 await fs.rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 console.log('relay delivery tests passed');

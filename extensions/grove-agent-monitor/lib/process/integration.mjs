@@ -1224,7 +1224,9 @@ export class GroveProcess {
       const before = this.leadTask();
       if (!before) return null;
       if (!before.tickets.some((k) => k.id === ref)) {
-        return `${engineerContext(before, { initial: false })} Grove has no reviewer report ${ref} for ${before.id}: nothing new. Carry on with what you were doing.`;
+        await this.collectResults();
+        const task = this.leadTask();
+        return task && this.nothingNew(task, `Grove has no reviewer report ${ref} for ${task.id}`);
       }
       // A steered report can land in the middle of later work: one from a round that's over, whose result
       // Grove already recorded, must not pull the engineer off what it's doing now.
@@ -1248,7 +1250,7 @@ export class GroveProcess {
       if (!task) return null;
       let known = true;
       try { known = (await this.board.readDecisions(task.id)).some((d) => d.seq === Number(m[1])); } catch { /* unsure: point at grove_next */ }
-      if (!known) return `${engineerContext(task, { initial: false })} Grove has no decision #${m[1]} for ${task.id}: nothing new. Carry on with what you were doing.`;
+      if (!known) return this.nothingNew(task, `Grove has no decision #${m[1]} for ${task.id}`);
       return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now: its "decisions" field has the full decision. Then do what it says.`;
     }
     if (kind === 'notice' && this.role === 'chief') {
@@ -1269,6 +1271,15 @@ export class GroveProcess {
       return chiefNotice(await this.withReport(item));
     }
     return null;
+  }
+
+  // Engineer: the reply to a relay for something Grove doesn't have. The host keeps one steering slot, so this
+  // pointer may have replaced a real one (a hold, a closing report): if anything is still unread, say so.
+  async nothingNew(task, what) {
+    const pending = this.unseenReports.size > 0 || (await this.hasUnreadDecisions(task));
+    return pending
+      ? `${engineerContext(task, { initial: false })} ${what}, but other news is waiting for you. Call grove_next now and do what it says before anything else.`
+      : `${engineerContext(task, { initial: false })} ${what}: nothing new. Carry on with what you were doing.`;
   }
 
   // Engineer: it sent one of its relay messages.
