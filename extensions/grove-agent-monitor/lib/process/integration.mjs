@@ -67,6 +67,16 @@ const DECISION_OUTCOMES = {
 };
 // Decisions the engineer has nothing to do for: its Grove applies them from the board without waking it.
 const QUIET_DECISIONS = new Set(['shelve', 'unshelve']);
+// Where an engineer's chat link came from. Each is tied to the engineer that holds the current hand-off; a
+// link with no source was written by an older Grove that didn't check, and is never used.
+const ROUTE_SOURCES = new Set(['chief', 'self', 'member']);
+// A decision's relay to its engineer is over once the engineer has applied, rejected or superseded it.
+const RELAY_FINAL = new Set(['applied', 'rejected', 'superseded']);
+const RELAY_MAX_DELAY_MS = 10 * 60 * 1000;
+const RELAY_MIN_ATTEMPTS = 3;
+const DECISION_REF = /^(T\d{1,6}):(\d{1,9})$/;
+// Errors shown to the human: one short line, with no link query strings.
+const relayError = (e) => clipText(String(e ?? '').replace(/(agent-host-session:\/\/[^\s?"']*)\?[^\s"']*/g, '$1').replace(/\s+/g, ' ').trim() || 'send failed', 160);
 
 // What a decision does to the task, in a few words.
 function decisionOutcome(t, before, decision, ship) {
@@ -268,16 +278,18 @@ async function lastAssistantText(transcriptPath) {
 }
 
 export class GroveProcess {
-  constructor({ log, onChange, pollMs = POLL_MS, graceMs = GRACE_MS, prPollMs = PR_POLL_MS, prStatus = ghPrStatus }) {
+  constructor({ log, onChange, pollMs = POLL_MS, graceMs = GRACE_MS, prPollMs = PR_POLL_MS, prStatus = ghPrStatus, now = Date.now }) {
     this.log = log;
     this.onChange = onChange;
     this.pollMs = pollMs;
     this.graceMs = graceMs;
     this.prPollMs = prPollMs;
     this.prStatus = prStatus;
+    this.now = now;
     this.prPolledAt = 0;
     this.seen = new Map(); // pending hand-off → when this session first saw it pending
-    this.leadCalls = new Map(); // chief: create_session call → task id (to learn each engineer's link)
+    this.leadCalls = new Map(); // chief: create_session call → { taskId, token } (to learn each engineer's link)
+    this.relayCalls = new Map(); // chief: send_message call → the decision relay attempt it carries
     this.role = 'none';
     this.board = null;
     this.engine = null;
@@ -295,7 +307,6 @@ export class GroveProcess {
     this.outbox = [];
     this.wokenFor = new Map(); // engineer: pending item id → times this session was woken for it
     this.inboxLog = []; // chief: what the human decided in the Grove inbox since the Chief's last turn
-    this.inboxPending = new Map(); // chief: task id → inbox decision its engineer hasn't applied yet
     this.attached = new Map(); // chief: task id → when the human attached it to their next message
     this.sessionError = null; // { message, at, count }: this session's last error, until a turn goes through
     this.turnActed = true; // whether the current turn said or did anything
@@ -367,6 +378,40 @@ export class GroveProcess {
   async becomeChief() {
     const board = await Board.openOrCreate(this.chiefRoot, { id: this.selfId, chiefSessionId: this.selfId, log: this.log });
     await this.bind(board, 'chief');
+    await this.reconcileRelays();
+  }
+
+  // Chief: a decision is written to the board before it is applied or its relay tracked, so after a restart
+  // any decision on a task the Chief still owns is applied here, and any pending decision without a relay
+  // gets one; its engineer is then followed up like any other.
+  async reconcileRelays() {
+    const pending = [];
+    for (const t of this.engine.state.tasks) {
+      if (this.engine.owns(t)) {
+        const applied = this.engine.applyDecisions(t, await this.board.readDecisions(t.id));
+        if (applied?.length) this.log(`Grove applied ${applied.length} outstanding decision${applied.length === 1 ? '' : 's'} on ${t.id} after a restart.`);
+        continue;
+      }
+      // Quiet decisions (shelve) skip the immediate message, not tracking: the engineer still has to apply them.
+      const items = (await this.board.readDecisions(t.id)).filter((d) => d.seq > (t.decisionsApplied ?? 0));
+      const item = items.at(-1);
+      if (item && (!TERMINAL.has(t.stage) || (t.stage === 'done' && item.action === 'changes'))) pending.push({ t, item });
+    }
+    if (!pending.length) return;
+    const changed = await this.board.updateMeta((meta) => {
+      let n = 0;
+      for (const { t, item } of pending) {
+        const relay = meta.decisionRelays?.[t.id];
+        if (relay && relay.seq >= item.seq) continue;
+        this.trackRelay(meta, t.id, item, this.leadRoute(t, meta).link ? 'recorded' : 'awaiting-engineer');
+        n += 1;
+      }
+      return n ? n : false;
+    });
+    if (changed) {
+      this.log(`Grove resumed ${changed} decision relay${changed === 1 ? '' : 's'} after a restart.`);
+      this.onChange();
+    }
   }
 
   async becomeLead({ boardId, taskId, token }, { resume }) {
@@ -384,6 +429,7 @@ export class GroveProcess {
         return task;
       }
       await this.invalidateRepair(task);
+      this.syncLeadRoute(task);
       await this.collectResults();
       await this.applyLeadDecisions({ wake: true });
       await this.checkPlacement({ force: true });
@@ -402,6 +448,7 @@ export class GroveProcess {
     }
     await writeLeadLink(this.leadFile, { boardId, taskId });
     await this.invalidateRepair(task);
+    this.syncLeadRoute(this.engine.task(taskId));
     // An engineer taking over a task that's under way catches up from the board: grove_next includes the
     // finished steps' results until it submits something.
     this.catchUp = this.engine.task(taskId).steps.some((x) => x.status === 'done' && x.output);
@@ -588,11 +635,111 @@ export class GroveProcess {
 
   // The engineer's own chat, for reviewers and the Chief to message.
   async leadLinkFor(taskId) {
+    return (await this.currentLeadLink(taskId)).link;
+  }
+
+  // Chief: a decision relay is checked again right before it goes out. An instruction queued earlier may
+  // name an engineer a newer hand-off has since replaced; that send is refused, and Grove re-sends to the
+  // current engineer once there is one.
+  async gateRelaySend(args) {
+    const r = RELAY_MARKER.exec(String(args?.message ?? ''));
+    const ref = r?.[1] === 'decision' && r[2] === this.board.id ? DECISION_REF.exec(r[3]) : null;
+    if (!ref) return undefined;
+    const [, taskId] = ref;
+    const seq = Number(ref[2]);
     await this.engine.refresh();
-    const t = this.engine.state.tasks.find((x) => x.id === taskId);
-    if (t?.lead?.link) return t.lead.link;
-    const meta = await this.board.reloadMeta();
-    return meta.leadLinks?.[taskId] ?? null;
+    const relay = this.board.meta.decisionRelays?.[taskId];
+    if (relay && relay.seq === seq && RELAY_FINAL.has(relay.state)) {
+      return deny(`Grove: decision #${seq} for ${taskId} is already ${relay.state}; don't send it again.`);
+    }
+    const task = this.engine.state.tasks.find((x) => x.id === taskId);
+    if (!task) return undefined;
+    const { link } = this.leadRoute(task);
+    const target = String(args?.session ?? '').split('?')[0];
+    if (link && link === target) return undefined;
+    // Re-target now rather than after the backoff: the next tick asks the Chief again with the current link.
+    if (relay && relay.seq === seq && link) {
+      await this.board.updateMeta((meta) => {
+        const cur = meta.decisionRelays?.[taskId];
+        if (!cur || cur.seq !== seq || RELAY_FINAL.has(cur.state)) return false;
+        cur.nextAt = this.now();
+        return true;
+      }).catch((err) => this.log(`Grove could not re-target a decision relay: ${err.message}`, 'warning'));
+    }
+    return deny(link
+      ? `Grove: ${target || 'that chat'} is no longer ${taskId}'s engineer. Don't send this; Grove relays decision #${seq} to the current engineer (${link}) itself.`
+      : `Grove: ${taskId} has no engineer to reach right now (a newer hand-off hasn't been claimed). Don't send this; Grove relays decision #${seq} once the new engineer starts.`);
+  }
+
+  // The current engineer's chat for a task, with fresh board state. Only the Chief writes the meta, so its
+  // own copy is current; other sessions reload it.
+  async currentLeadLink(taskId) {
+    await this.engine.refresh();
+    const meta = this.role === 'chief' ? this.board.meta : await this.board.reloadMeta();
+    return this.leadRoute(this.engine.state.tasks.find((x) => x.id === taskId), meta);
+  }
+
+  // A link is used only when it belongs to the engineer holding the current hand-off: the engineer's own
+  // (from get_current_session, or a reviewer's nested chat), or the one the Chief saw create_session return
+  // for that same hand-off. While a newer hand-off is unclaimed there is no route: the old chat may be gone.
+  leadRoute(t, meta = this.board.meta) {
+    if (!t) return { link: null, route: 'none', handoffPending: false };
+    const handoffPending = (meta.handoffs?.[t.id] ?? null) !== (t.lead?.token ?? null);
+    const quarantined = !!t.lead?.link && !ROUTE_SOURCES.has(t.lead.linkSource);
+    let link = null;
+    if (t.lead && !handoffPending) {
+      const r = meta.leadRoutes?.[t.id];
+      if (t.lead.link && !quarantined) link = t.lead.link;
+      else if (r?.token === t.lead.token && isSessionLink(r.link)) link = r.link;
+    }
+    return { link, route: link ? 'verified' : 'none', handoffPending, ...(quarantined ? { quarantined: true } : {}) };
+  }
+
+  // Engineer: drop a link an older Grove stored without checking whose it was, and take the Chief's route
+  // when it was learned for this engineer's own hand-off.
+  syncLeadRoute(task, meta = this.board.meta) {
+    const lead = task?.lead;
+    if (!lead || !this.engine.owns(task)) return;
+    if (lead.link && !ROUTE_SOURCES.has(lead.linkSource)) {
+      delete lead.link;
+      delete lead.linkSource;
+      this.engine.changed(task, 'Grove cleared an engineer link it could not verify; it relearns this chat\'s link.');
+    }
+    const r = meta.leadRoutes?.[task.id];
+    if (!lead.link && r?.token === lead.token && isSessionLink(r.link)) {
+      lead.link = r.link;
+      lead.linkSource = 'chief';
+      this.engine.changed(task, null);
+    }
+  }
+
+  // Engineer: get_current_session named this chat.
+  learnSelfLink(openLink) {
+    const task = this.leadTask();
+    const base = String(openLink ?? '').split('?')[0];
+    if (!task?.lead || !this.engine.owns(task) || !isSessionLink(base)) return;
+    if (task.lead.link === base && task.lead.linkSource === 'self') return;
+    task.lead.link = base;
+    task.lead.linkSource = 'self';
+    this.engine.changed(task, null);
+  }
+
+  // Chief: a new hand-off (or a new task) starts a new route generation. The previous engineer's links stop
+  // working, and a decision still on its way waits for the new engineer.
+  resetRoute(meta, id) {
+    const now = this.now();
+    meta.gen = { ...(meta.gen ?? {}), [id]: (meta.gen?.[id] ?? 0) + 1 };
+    if (meta.leadRoutes) delete meta.leadRoutes[id];
+    if (meta.leadLinks) delete meta.leadLinks[id];
+    const relay = meta.decisionRelays?.[id];
+    if (relay && !RELAY_FINAL.has(relay.state)) {
+      meta.decisionRelays[id] = { ...relay, generation: meta.gen[id], attempt: 0, attempts: 0, requests: 0, wakeFailures: 0, sentAttempt: undefined, state: 'awaiting-engineer', since: now, nextAt: now + this.graceMs, lastError: undefined };
+    }
+  }
+
+  // Backoff between relays: by the Chief's requests (so an idle Chief isn't flooded) or its real sends.
+  relayDelay(n) {
+    return Math.min(Math.max(this.graceMs, 1) * 2 ** (n ?? 0), RELAY_MAX_DELAY_MS);
   }
 
   // The reviewer's turn ended without a review (an error, or Grove restarted). Continue in this same chat:
@@ -727,19 +874,82 @@ export class GroveProcess {
       notified[t.id] = key;
       sends.push({ id: t.id, text: `[Grove → Chief of Staff] ${taskLabel(t)} "${t.title}" has stalled: its engineer stopped responding (${t.stalled.tickets.join(', ')}). Call grove_handoff for ${t.id} and start a new engineer with create_session using the returned fields; it picks the task up from the board. Then tell the human in one line and end your turn.` });
     }
-    // An inbox decision normally reaches the engineer through its own poll of the board. If its session
-    // isn't running, the Chief has to message it.
-    for (const [taskId, p] of this.inboxPending) {
-      const t = this.engine.state.tasks.find((x) => x.id === taskId);
-      if (!t || (t.decisionsApplied ?? 0) >= p.seq || TERMINAL.has(t.stage)) { this.inboxPending.delete(taskId); continue; }
-      if (now - p.at < this.graceMs || p.relayed) continue;
-      p.relayed = true;
-      if (p.message) sends.push({ id: null, text: `[Grove] The human ${INBOX_WORDS[p.action]} ${taskLabel(t)} "${t.title}"${p.via === 'chat' ? '' : ' in the Grove inbox'}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${p.message.session}\nmessage: ${p.message.message}\nThen end your turn without further comment.` });
+    // An inbox decision normally reaches the engineer through its own poll of the board, and a chat decision
+    // through the Chief's message. Until the engineer applies it, the Chief relays it again with backoff;
+    // with no reachable engineer it asks once (per hand-off) for a new one.
+    const relayChanged = await this.advanceRelays(sends);
+    if (!sends.length) {
+      if (relayChanged) {
+        await this.board.saveMeta();
+        this.onChange();
+      }
+      return;
     }
-    if (!sends.length) return;
     // Send before recording: after a crash a notice may repeat, but it is never lost.
-    for (const s of sends) if (!(await this.wake(s.text, { retry: false })) && s.id) delete notified[s.id];
+    for (const s of sends) {
+      if (await this.wake(s.text, { retry: false })) continue;
+      if (s.id) delete notified[s.id];
+      const relay = s.relay && this.board.meta.decisionRelays?.[s.relay];
+      if (relay) {
+        relay.wakeFailures = (relay.wakeFailures ?? 0) + 1;
+        if (s.asked) delete relay.askedGen;
+        relay.lastError = 'could not post to the Chief\'s chat';
+      }
+    }
     await this.board.saveMeta();
+    if (relayChanged) this.onChange();
+  }
+
+  // Chief: move each decision relay along. Returns whether any changed; adds messages for the Chief to `sends`.
+  async advanceRelays(sends) {
+    const relays = this.board.meta.decisionRelays ?? {};
+    const now = this.now();
+    let changed = false;
+    const set = (relay, state, extra = {}) => {
+      if (relay.state === state && !Object.keys(extra).length) return;
+      Object.assign(relay, { state }, extra);
+      changed = true;
+    };
+    for (const [taskId, relay] of Object.entries(relays)) {
+      if (RELAY_FINAL.has(relay.state)) continue;
+      const t = this.engine.state.tasks.find((x) => x.id === taskId);
+      if (!t) continue;
+      if ((t.decisionsApplied ?? 0) >= relay.seq) {
+        const r = this.engine.decisionResult(t, relay.seq);
+        set(relay, r?.result ?? 'applied', r?.reason ? { reason: r.reason } : {});
+        continue;
+      }
+      if (TERMINAL.has(t.stage) && !(t.stage === 'done' && relay.action === 'changes')) {
+        set(relay, 'superseded', { reason: `the task is already ${t.stage}` });
+        continue;
+      }
+      if (now < (relay.nextAt ?? 0)) continue;
+      const route = this.leadRoute(t);
+      const exhausted = (relay.attempts ?? 0) >= RELAY_MIN_ATTEMPTS && now - relay.since >= RELAY_MAX_DELAY_MS;
+      if (route.handoffPending) {
+        set(relay, 'awaiting-engineer');
+        continue;
+      }
+      if (!route.link || exhausted) {
+        set(relay, 'needs-new-engineer');
+        if (relay.askedGen !== relay.generation) {
+          relay.askedGen = relay.generation;
+          changed = true;
+          const why = route.link ? `${relay.attempts} relays haven't reached it${relay.lastError ? ` (last error: ${relay.lastError})` : ''}` : 'Grove has no confirmed link to its chat';
+          sends.push({ id: null, relay: taskId, asked: true, text: `[Grove → Chief of Staff] ${taskLabel(t)} "${t.title}": the human's decision (#${relay.seq}, "${relay.action}") hasn't reached its engineer: ${why}. Call grove_handoff for ${t.id} and start a new engineer with create_session using the returned fields; it applies the decision from the board. Then tell the human in one line and end your turn.` });
+        }
+        continue;
+      }
+      const item = (await this.board.readDecisions(taskId)).find((d) => d.seq === relay.seq);
+      if (!item) continue;
+      // A request asks the Chief to send; only a send_message the Chief actually runs counts as an attempt.
+      relay.attempt = (relay.attempt ?? 0) + 1;
+      relay.requests = (relay.requests ?? 0) + 1;
+      set(relay, 'relay-requested', { nextAt: now + this.relayDelay(relay.requests) });
+      const words = INBOX_WORDS[relay.action] ? `${INBOX_WORDS[relay.action]}` : `decided "${relay.action}" for`;
+      sends.push({ id: null, relay: taskId, text: `[Grove] The human ${words} ${taskLabel(t)} "${t.title}"${relay.via === 'grove' ? ' in the Grove inbox' : ''}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${route.link}\nmessage: ${decisionMessage(this.board.id, t, item)}\nThen end your turn without further comment.` });
+    }
+    return changed;
   }
 
   // Engineer: apply the human's decisions recorded by the Chief. The Chief normally messages this chat too;
@@ -769,10 +979,7 @@ export class GroveProcess {
     const out = [];
     if (!task || TERMINAL.has(task.stage)) return out;
     const meta = await this.board.reloadMeta();
-    if (!task.lead?.link && meta.leadLinks?.[task.id] && this.engine.owns(task)) {
-      task.lead.link = meta.leadLinks[task.id];
-      this.engine.changed(task, null);
-    }
+    this.syncLeadRoute(task, meta);
     const nk = noticeKey(task);
     if (nk && task.noticeSent !== nk && isSessionLink(meta.chiefLink)) {
       out.push({ id: `notice:${nk}`, tool: 'send_message', session: meta.chiefLink, message: noticeMessage(this.board.id, task, nk), purpose: 'tell the Chief of Staff the human is needed' });
@@ -782,6 +989,66 @@ export class GroveProcess {
       out.push({ id: `notice:${ak}`, tool: 'send_message', session: meta.chiefLink, message: noticeMessage(this.board.id, task, ak), purpose: 'give the Chief of Staff the answer to the human\'s question' });
     }
     return out;
+  }
+
+  // Chief: it is running send_message for a decision relay. That is a delivery attempt (once per request).
+  relayStarted(call) {
+    return this.board.updateMeta((meta) => {
+      const relay = meta.decisionRelays?.[call.taskId];
+      if (!relay || RELAY_FINAL.has(relay.state)) return false;
+      if (relay.seq !== call.seq || relay.generation !== call.generation || relay.attempt !== call.attempt || relay.sentAttempt === call.attempt) return false;
+      // A send to a chat that is no longer the engineer's is refused before it runs; it isn't an attempt.
+      const t = this.engine.state.tasks.find((x) => x.id === call.taskId);
+      if (!t || this.leadRoute(t, meta).link !== call.target) return false;
+      relay.attempts = (relay.attempts ?? 0) + 1;
+      relay.sentAttempt = call.attempt;
+      return true;
+    });
+  }
+
+  // Chief: its send_message for a decision relay finished. The result is recorded only if it's for the relay's
+  // current attempt, under the current hand-off, sent to the engineer's current chat; anything else is late.
+  relaySent(call, d) {
+    const ok = d.success !== false && !wasDenied(d);
+    const error = ok ? null : d.error?.message || (d.result ? resultText(d.result) : '');
+    return this.board.updateMeta((meta) => {
+      const relay = meta.decisionRelays?.[call.taskId];
+      const t = this.engine.state.tasks.find((x) => x.id === call.taskId);
+      if (!relay || !t || RELAY_FINAL.has(relay.state)) return false;
+      if (relay.seq !== call.seq || relay.generation !== call.generation || relay.attempt !== call.attempt) return false;
+      if (this.leadRoute(t, meta).link !== call.target) return false;
+      if (ok) {
+        relay.state = 'delivery-accepted';
+        delete relay.lastError;
+      } else {
+        relay.state = 'delivery-failed';
+        relay.lastError = relayError(error);
+      }
+      relay.nextAt = this.now() + this.relayDelay(relay.attempts);
+      return true;
+    }).then((out) => {
+      if (out) this.onChange();
+    });
+  }
+
+  // Chief: start tracking a decision until its engineer applies it.
+  trackRelay(meta, taskId, item, state) {
+    const now = this.now();
+    meta.decisionRelays = { ...(meta.decisionRelays ?? {}), [taskId]: {
+      seq: item.seq, action: item.action, via: item.via ?? 'chat', generation: meta.gen?.[taskId] ?? 0,
+      attempt: 0, attempts: 0, requests: 0, wakeFailures: 0, state, since: now, nextAt: now + this.graceMs,
+    } };
+  }
+
+  // Chief: the human's latest decision for a task, as the inbox and grove_status show it. No tokens or links.
+  decisionView(taskId) {
+    const relay = this.board?.meta.decisionRelays?.[taskId];
+    if (!relay) return null;
+    const t = this.engine?.state.tasks.find((x) => x.id === taskId);
+    const result = t && (t.decisionsApplied ?? 0) >= relay.seq ? this.engine.decisionResult(t, relay.seq) : null;
+    const state = result?.result ?? relay.state;
+    const reason = result?.reason ?? relay.reason ?? (['delivery-failed', 'needs-new-engineer'].includes(state) ? relay.lastError : undefined);
+    return { seq: relay.seq, action: relay.action, state, ...(relay.attempts ? { attempts: relay.attempts } : {}), ...(reason ? { reason } : {}) };
   }
 
   // Engineer: everything it still has to do (its step, hires, messages, decisions, answers).
@@ -934,8 +1201,9 @@ export class GroveProcess {
       if (ev.type === 'tool.execution_start' && d.toolName === 'get_current_session') this.metadataCalls.add(d.toolCallId);
       if (ev.type === 'tool.execution_complete' && this.metadataCalls.delete(d.toolCallId) && d.success !== false) {
         try {
-          const metadata = typeof d.result?.workingDirectory === 'string' ? d.result : JSON.parse(resultText(d.result));
+          const metadata = typeof d.result?.workingDirectory === 'string' || typeof d.result?.openLink === 'string' ? d.result : JSON.parse(resultText(d.result));
           if (typeof metadata.workingDirectory === 'string') this.metadataDirectory = metadata.workingDirectory;
+          if (typeof metadata.openLink === 'string') this.learnSelfLink(metadata.openLink);
         } catch (err) {
           this.log(`Grove could not read current-session placement metadata: ${err.message}`, 'warning');
         }
@@ -962,19 +1230,38 @@ export class GroveProcess {
       }
     }
     // Chief: remember each engineer's session link (from create_session's result) so the human's decisions
-    // can be sent there.
+    // can be sent there, but only while the hand-off it was started with is still the current one.
     if (this.role === 'chief' && this.board) {
       if (ev.type === 'tool.execution_start' && d.toolName === 'create_session') {
         const m = LEAD_MARKER.exec(String(d.arguments?.prompt ?? ''));
-        if (m && m[1] === this.board.id) this.leadCalls.set(d.toolCallId, m[2]);
+        if (m && m[1] === this.board.id) this.leadCalls.set(d.toolCallId, { taskId: m[2], token: m[3] });
       } else if (ev.type === 'tool.execution_complete' && this.leadCalls.has(d.toolCallId)) {
-        const taskId = this.leadCalls.get(d.toolCallId);
+        const { taskId, token } = this.leadCalls.get(d.toolCallId);
         this.leadCalls.delete(d.toolCallId);
         const link = d.success !== false && !wasDenied(d) ? SESSION_LINK.exec(resultText(d.result))?.[0] : null;
         if (link) {
-          this.board.meta.leadLinks = { ...(this.board.meta.leadLinks ?? {}), [taskId]: link.split('?')[0] };
-          void this.board.saveMeta().catch((err) => this.log(`Grove could not save an engineer's link: ${err.message}`, 'warning'));
+          const clean = link.split('?')[0];
+          void this.board.updateMeta((meta) => {
+            if (meta.handoffs?.[taskId] !== token) return false;
+            meta.leadRoutes = { ...(meta.leadRoutes ?? {}), [taskId]: { link: clean, token } };
+            meta.leadLinks = { ...(meta.leadLinks ?? {}), [taskId]: clean };
+            return true;
+          }).catch((err) => this.log(`Grove could not save an engineer's link: ${err.message}`, 'warning'));
         }
+      } else if (ev.type === 'tool.execution_start' && d.toolName === 'send_message') {
+        // A decision relay the Chief is sending: its result counts only for this exact relay attempt.
+        const r = RELAY_MARKER.exec(String(d.arguments?.message ?? ''));
+        const ref = r?.[1] === 'decision' && r[2] === this.board.id ? DECISION_REF.exec(r[3]) : null;
+        const relay = ref && this.board.meta.decisionRelays?.[ref[1]];
+        if (relay && relay.seq === Number(ref[2])) {
+          const call = { taskId: ref[1], seq: relay.seq, generation: relay.generation, attempt: relay.attempt, target: String(d.arguments?.session ?? '').split('?')[0] };
+          this.relayCalls.set(d.toolCallId, call);
+          void this.relayStarted(call).catch((err) => this.log(`Grove could not record a decision relay: ${err.message}`, 'warning'));
+        }
+      } else if (ev.type === 'tool.execution_complete' && this.relayCalls.has(d.toolCallId)) {
+        const call = this.relayCalls.get(d.toolCallId);
+        this.relayCalls.delete(d.toolCallId);
+        void this.relaySent(call, d).catch((err) => this.log(`Grove could not record a decision relay: ${err.message}`, 'warning'));
       }
       return;
     }
@@ -1153,6 +1440,7 @@ export class GroveProcess {
               throw err;
             }
           }
+          if (name === 'send_message') return this.gateRelaySend(args);
           return undefined;
         }
         if (this.role === 'member') {
@@ -1221,9 +1509,15 @@ export class GroveProcess {
       return `${engineerContext(task, { initial: false })} A reviewer reported back${n ? '; Grove recorded it' : ''}. Call grove_next now and do what it says.`;
     }
     if (kind === 'decision' && this.role === 'lead') {
+      const seq = Number(DECISION_REF.exec(String(ref ?? ''))?.[2] ?? 0);
+      const before = this.leadTask()?.decisionsApplied ?? 0;
       await this.applyLeadDecisions();
       const task = this.leadTask();
       if (!task) return null;
+      const r = seq ? this.engine.decisionResult(task, seq) : null;
+      const how = r ? ` (result: ${r.result}${r.reason ? `: ${r.reason}` : ''})` : '';
+      if (seq && seq <= before) return `${engineerContext(task, { initial: false })} Decision #${seq} was already applied${how}; call grove_next if you haven't since.`;
+      if (r && r.result !== 'applied') return `${engineerContext(task, { initial: false })} Decision #${seq} was not applied${how}. Call grove_next now and do what it says.`;
       return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now and do what it says.`;
     }
     if (kind === 'notice' && this.role === 'chief') {
@@ -1367,8 +1661,10 @@ export class GroveProcess {
           const n = this.board.meta.nextTask++;
           const id = `T${n}`;
           const token = newHandoffToken();
-          this.board.meta.handoffs[id] = token;
-          await this.board.saveMeta();
+          await this.board.updateMeta((meta) => {
+            meta.handoffs[id] = token;
+            this.resetRoute(meta, id);
+          });
           const t = this.engine.createTask({ id, name: taskName(this.board.id, n), title, goal, criteria: criteria ?? [], kind, destination: target, chiefDirectory: this.leadWorkspace() });
           await this.board.flush();
           return { task: id, name: t.name, handoff: this.handoff(t, token), guidance: this.handoffGuidance(t) };
@@ -1386,9 +1682,12 @@ export class GroveProcess {
             ? { mode: 'existing-worktree', workspace: t.lastVerifiedPlacement.directory }
             : destination(t.destination ?? this.board.meta.destinations?.[id]);
           const token = newHandoffToken();
-          this.board.meta.handoffs[id] = token;
-          this.board.meta.destinations = { ...this.board.meta.destinations, [id]: target };
-          await this.board.saveMeta();
+          await this.board.updateMeta((meta) => {
+            meta.handoffs[id] = token;
+            meta.destinations = { ...meta.destinations, [id]: target };
+            this.resetRoute(meta, id);
+          });
+          this.onChange();
           return { task: id, ...(t.name ? { name: t.name } : {}), handoff: this.handoff(t, token), guidance: this.handoffGuidance(t) };
         }),
       },
@@ -1690,14 +1989,11 @@ export class GroveProcess {
     const key = noticeKey(t);
     if (key) this.board.meta.notified[taskId] = key;
     await this.board.saveMeta();
-    if (!this.inboxPending.has(taskId) || this.inboxPending.get(taskId).seq !== out.recorded.seq) {
-      this.inboxPending.set(taskId, { seq: out.recorded.seq, at: Date.now(), action: decision, message: out.message, via: 'grove' });
-    }
     const outcome = decisionOutcome(t, before, decision);
-    this.inboxLog.push({ taskId, label: taskLabel(t), title: t.title, action: decision, outcome });
+    if (!out.duplicate) this.inboxLog.push({ taskId, label: taskLabel(t), title: t.title, action: decision, outcome });
     if (decision === 'cancel') this.attached.delete(taskId);
     this.onChange();
-    return { task: taskId, decision, outcome };
+    return { task: taskId, decision, outcome, ...(out.duplicate ? { duplicate: true } : {}) };
   }
 
   // "Attach to chat" in the Grove inbox: the human's next message in the Chief's chat is about these tasks.
@@ -1738,7 +2034,7 @@ export class GroveProcess {
       if (human?.kind === 'resolve-escalation') lines.push(`Why: ${clipText(t.escalation?.reason ?? human.text, 600)}`);
       if (t.delivery?.summary) lines.push(`Engineer's summary: ${clipText(t.delivery.summary, 1500)}`);
       if (human) lines.push(`Report: ${reportPath(this.engine.root, t.id)}`);
-      const lead = t.lead?.link ?? this.board.meta.leadLinks?.[t.id];
+      const lead = this.leadRoute(t).link;
       if (lead) lines.push(`Engineer session: ${lead}`);
       if (TERMINAL.has(t.stage)) lines.push('This task has already finished; tell the human, and start a new task if they want more.');
       else if (t.stage === 'shelved') lines.push('Their message is probably about picking it up again. Record their answer as usual and it comes off the shelf: "approve", "changes" with their words (for example to run it again with new data: the same engineer redoes it in its own chat), "merge", "retry", "question" or "note". To just put it back in their inbox, record "unshelve"; to drop it, "cancel". Then send any returned message to the engineer.');
@@ -1794,6 +2090,7 @@ export class GroveProcess {
           report: `report/${h.taskId}/`,
           ...(h.pr?.url ? { pr: h.pr.url } : {}),
           ...(kind === 'sign-off' && h.ask ? { ask: clipText(h.ask, 300) } : {}),
+          ...(this.decisionView(h.taskId) ? { decision: this.decisionView(h.taskId) } : {}),
         };
       }),
     };
@@ -1813,19 +2110,19 @@ export class GroveProcess {
       if (!(await fs.stat(target.workspaceFolder)).isDirectory()) throw new PlacementError('Repair target is not a directory.');
       repair = { sessionId: t.lead.sessionId, target };
     }
-    const item = await this.board.appendDecision(id, { action: decision, note, via,
-      ...(typeof ship === 'boolean' ? { ship } : {}), ...(repair ? { workspaceRepair: repair } : {}) });
-    if (this.engine.owns(t)) this.engine.applyDecisions(t, await this.board.readDecisions(id));
+    const { item, duplicate } = await this.board.appendDecision(id, { action: decision, note, via,
+      ...(typeof ship === 'boolean' ? { ship } : {}), ...(repair ? { workspaceRepair: repair } : {}) }, { appliedThrough: t.decisionsApplied ?? 0 });
+    const owned = this.engine.owns(t);
+    if (owned) this.engine.applyDecisions(t, await this.board.readDecisions(id));
     const outcome = decisionOutcome(t, before, decision, ship);
-    const leadLink = t.lead?.link ?? this.board.meta.leadLinks?.[id];
-    let message = t.lead && !this.engine.owns(t) && isSessionLink(leadLink)
-      ? { tool: 'send_message', session: leadLink, message: decisionMessage(this.board.id, t, item) }
+    const route = this.leadRoute(t);
+    // Only an engineer known to hold the current hand-off is messaged. Shelving needs nothing from it: its
+    // Grove picks it up from the board, and the grove shows it at once.
+    const message = !duplicate && t.lead && !owned && route.link && !QUIET_DECISIONS.has(decision)
+      ? { tool: 'send_message', session: route.link, message: decisionMessage(this.board.id, t, item) }
       : null;
-    // Shelving needs nothing from the engineer: its Grove picks it up from the board, and the grove shows it at
-    // once. The Chief only messages the engineer if that doesn't happen (its session isn't running).
-    if (QUIET_DECISIONS.has(decision) && message) {
-      this.inboxPending.set(id, { seq: item.seq, at: Date.now(), action: decision, message, via });
-      message = null;
+    if (!owned && !duplicate) {
+      await this.board.updateMeta((meta) => this.trackRelay(meta, id, item, message && via !== 'grove' ? 'relay-requested' : route.link ? 'recorded' : 'awaiting-engineer'));
       this.onChange();
     }
     const tell = outcome === 'back to work' ? 'Tell the human what happens next'
@@ -1834,12 +2131,18 @@ export class GroveProcess {
           : outcome === 'shipping' ? `Tell the human ${id}'s engineer will publish the pull request, and Grove will watch it through checks and review and come back when it's ready to merge or needs them`
             : outcome === 'on the shelf' ? `Tell the human ${id} is on the shelf: it's out of their inbox, its engineer is resting with everything intact, and they can bring it back from the shelf in the Grove (or by asking you) whenever they're ready${t.ship?.pr ? '; Grove keeps watching its PR and brings it back if the PR needs work' : ''}`
             : `Tell the human ${id} is ${outcome}`;
+    const unrouted = !owned && !message && !QUIET_DECISIONS.has(decision) && !route.link
+      ? ` ${id}'s engineer chat isn't confirmed${route.handoffPending ? ' (a new engineer hasn\'t started yet)' : ''}, so there's nothing to send now: its engineer applies it from the board, and Grove asks you for a new engineer if none does.`
+      : '';
     return {
       recorded: { task: id, decision, seq: item.seq },
+      ...(duplicate ? { duplicate: true } : {}),
       message,
-      guidance: message
-        ? `Recorded. Now send ${id}'s engineer the message below with send_message, exactly as given, so it picks the decision up. Then ${tell[0].toLowerCase()}${tell.slice(1)} and end your turn.`
-        : `Recorded. ${tell} and end your turn.`,
+      guidance: duplicate
+        ? `This decision was already recorded (#${item.seq}) and is still on its way to ${id}'s engineer; nothing new to send. Tell the human it's in hand and end your turn.`
+        : message
+          ? `Recorded. Now send ${id}'s engineer the message below with send_message, exactly as given, so it picks the decision up. Then ${tell[0].toLowerCase()}${tell.slice(1)} and end your turn.`
+          : `Recorded.${unrouted} ${tell} and end your turn.`,
     };
   }
 
@@ -1946,6 +2249,18 @@ export class GroveProcess {
     });
   }
 
+  // Where the engineer can be reached. A pending hand-off means the last engineer's chat is no longer used.
+  engineerStatus(t) {
+    const r = this.leadRoute(t);
+    return {
+      session: r.link,
+      route: r.route,
+      handoffPending: r.handoffPending,
+      ...(r.quarantined ? { quarantined: true } : {}),
+      status: r.handoffPending ? 'a new engineer has been asked for and hasn\'t started yet' : r.link ? 'working in its own session' : 'working in its own session (Grove has no confirmed link to its chat yet)',
+    };
+  }
+
   status(id) {
     const tasks = id ? [this.engine.task(id)] : this.engine.state.tasks;
     return {
@@ -1956,7 +2271,9 @@ export class GroveProcess {
         stage: stageLabel(t),
         kind: t.kind,
         ...(t.destination ? { destination: t.destination, placement: t.placement ?? { status: 'unknown' } } : {}),
-        engineer: t.lead ? { session: t.lead.link ?? this.board.meta.leadLinks?.[t.id] ?? null, status: 'working in its own session' } : TERMINAL.has(t.stage) ? null : 'not started: call grove_handoff and create_session',
+        engineer: t.lead ? this.engineerStatus(t) : TERMINAL.has(t.stage) ? null : 'not started: call grove_handoff and create_session',
+        ...(this.decisionView(t.id) ? { decision: this.decisionView(t.id) } : {}),
+        ...(t.decisionResults?.length ? { decisions: t.decisionResults.slice(-5).map((r) => ({ seq: r.seq, action: r.action, result: r.result, ...(r.reason ? { reason: r.reason } : {}) })) } : {}),
         ...(errorText(t.lead?.error) ? { engineerError: errorText(t.lead.error) } : {}),
         reviewers: Object.values(t.members ?? {}).map((m) => ({ reviewer: m.title, session: m.link, status: m.status, worktree: !!m.worktree })),
         steps: this.stepsSummary(t),
@@ -1982,9 +2299,9 @@ export class GroveProcess {
   // shows, so the inbox and the lantern react at once.
   viewTasks() {
     return this.engine.state.tasks.map((t) => {
-      const p = this.inboxPending.get(t.id);
-      if (!p || (t.decisionsApplied ?? 0) >= p.seq) return t;
-      if (p.action === 'shelve' && t.stage !== 'shelved') return { ...t, stage: 'shelved', shelf: { from: t.stage, at: p.at, note: '' } };
+      const p = this.board?.meta.decisionRelays?.[t.id];
+      if (!p || RELAY_FINAL.has(p.state) || (t.decisionsApplied ?? 0) >= p.seq) return t;
+      if (p.action === 'shelve' && t.stage !== 'shelved') return { ...t, stage: 'shelved', shelf: { from: t.stage, at: p.since, note: '' } };
       if (p.action === 'unshelve' && t.stage === 'shelved') return { ...t, stage: t.shelf?.from ?? 'awaiting-approval', shelf: null };
       return t;
     });
@@ -2081,6 +2398,7 @@ export class GroveProcess {
             verification: x.verification ? { result: x.verification.result, artifacts: x.verification.items.length } : null,
           })),
           delivery: t.delivery?.summary ?? null,
+          decision: this.decisionView(t.id),
           working: t.tickets.filter((k) => IN_FLIGHT.has(k.status)).length,
           kind: t.kind,
           engineer: TERMINAL.has(t.stage) ? null : t.lead ? 'active' : 'pending',

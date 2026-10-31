@@ -397,4 +397,27 @@ await assert.rejects(evEngine.submit('T92', 'S1', 'x'), /summary of what you did
   assert.deepEqual(old.state.tasks.map((t) => t.name), [taskName('board-a', 2), 'Kept']);
 }
 
+// ---- the human's decisions: a cancel overtakes the decisions queued before it ----
+{
+  const t = task({ template: 'research' });
+  const items = [
+    { seq: 1, action: 'approve', via: 'grove' },
+    { seq: 2, action: 'note', note: 'FYI: the numbers moved.' },
+    { seq: 3, action: 'cancel', via: 'grove' },
+  ];
+  // Out of order on the board; applied in seq order.
+  const applied = engine.applyDecisions(t, [items[2], items[0], items[1]]);
+  assert.deepEqual(applied.map((d) => d.seq), [2, 3], 'the approve never runs');
+  assert.equal(t.stage, 'cancelled');
+  assert.equal(t.decisionsApplied, 3);
+  assert.deepEqual(t.decisionResults.map((r) => [r.seq, r.result, r.by ?? null]), [[1, 'superseded', 3], [2, 'applied', null], [3, 'applied', null]]);
+  assert.match(engine.decisionResult(t, 1).reason, /overtaken by cancel #3/);
+  assert.deepEqual(engine.applyDecisions(t, items), [], 'applied decisions are never applied again');
+  // A decision that arrives after the cancel can't undo it.
+  assert.deepEqual(engine.applyDecisions(t, [...items, { seq: 4, action: 'approve', via: 'grove' }]), []);
+  assert.equal(engine.decisionResult(t, 4).result, 'rejected');
+  assert.equal(t.stage, 'cancelled');
+  assert.equal(engine.decisionResult(t, 99), null);
+}
+
 console.log('engine tests passed');
