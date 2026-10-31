@@ -23,9 +23,11 @@ const groupOf = (s) => s.link.split('?')[0];
 
 // A fake session: event listeners plus a record of what Grove posted into it with session.send (the
 // fallback path; visible hand-offs go through send_message instead). Fallback wakes are off by default.
-async function startSession(id, { link, workingDirectory = path.join(tmp, id, 'cwd'), graceMs = 10 * 60 * 1000 } = {}) {
+// `restart` is a disposed session's chat: a new Grove attaches to the same chat and files.
+async function startSession(id, { link, workingDirectory = path.join(tmp, id, 'cwd'), graceMs = 10 * 60 * 1000, restart } = {}) {
   const listeners = [];
   const sent = [];
+  if (restart) ({ link, session: { workingDirectory } } = restart);
   await fs.mkdir(workingDirectory, { recursive: true });
   const session = { sessionId: id, workingDirectory, workspacePath: path.join(tmp, id), on: (fn) => listeners.push(fn), send: async (m) => { sent.push(typeof m === 'string' ? m : m.prompt); return `m${sent.length}`; } };
   const proc = new GroveProcess({ log: () => {}, onChange: () => {}, pollMs: 0, graceMs, prPollMs: 0, prStatus: async () => { if (ghState instanceof Error) throw ghState; return ghState; } });
@@ -39,7 +41,7 @@ async function startSession(id, { link, workingDirectory = path.join(tmp, id, 'c
   const emit = (ev) => listeners.forEach((fn) => fn(ev));
   const s = { id, proc, tools, hooks, call, emit, sent, session, link: link ?? `agent-host-session://ahp-session/G-${id}` };
   links.set(s.link, s);
-  all.push(s);
+  if (!restart) all.push(s);
   return s;
 }
 const settle = async (...s) => { for (const x of s) await x.proc.board?.flush(); };
@@ -711,10 +713,10 @@ const relayTick = async (mins = 10) => {
 };
 const relayOf = (text) => ({ session: /\nsession: (\S+)\n/.exec(text)[1], message: /\nmessage: ([\s\S]*?)\nThen end your turn/.exec(text)[1] });
 let rtc = 0;
-const chiefSend = (args, outcome) => {
+const chiefSend = (args, outcome, c = chief) => {
   const toolCallId = `relay-${++rtc}`;
-  chief.emit({ type: 'tool.execution_start', data: { toolCallId, toolName: 'send_message', arguments: args } });
-  const finish = (ok) => chief.emit({ type: 'tool.execution_complete', data: ok ? { toolCallId, success: true, result: { content: '{"action":"started"}' } } : { toolCallId, success: false, error: { message: `Session not found (${args.session}?token=secret)` } } });
+  c.emit({ type: 'tool.execution_start', data: { toolCallId, toolName: 'send_message', arguments: args } });
+  const finish = (ok) => c.emit({ type: 'tool.execution_complete', data: ok ? { toolCallId, success: true, result: { content: '{"action":"started"}' } } : { toolCallId, success: false, error: { message: `Session not found (${args.session}?token=secret)` } } });
   if (outcome !== undefined) finish(outcome);
   return finish;
 };
@@ -765,6 +767,7 @@ await settle(chief);
 assert.equal(chief.proc.decisionView('T6').state, 'delivery-accepted');
 await relayTick();
 const late = chiefSend(relayOf(chief.sent.at(-1)));
+await settle(chief);
 assert.equal(chief.proc.decisionView('T6').attempts, 3);
 await relayTick();
 assert.equal(chief.proc.decisionView('T6').state, 'needs-new-engineer');
@@ -832,6 +835,48 @@ assert.ok(tokens.length);
 const shown = JSON.stringify([(await chief.call('grove_status')).data, chief.proc.liveView()]);
 for (const tok of tokens) assert.ok(!shown.includes(tok), 'no hand-off token in status or views');
 
+// 16d. A decision written just before the Chief's chat restarted (so no relay was tracked) is picked up when
+//      it comes back. Wakes the Chief never acts on aren't relays, so they never give up on the engineer;
+//      a failed send is retried, and the decision converges once the engineer applies it.
+const t7d = chief.proc.engine.task('T7');
+await chief.proc.board.appendDecision('T7', { action: 'note', note: 'Count forks too.', via: 'chat' }, { appliedThrough: t7d.decisionsApplied ?? 0 });
+assert.equal(chief.proc.decisionView('T7'), null, 'the Chief went away before tracking it');
+await chief.proc.dispose();
+const chief2 = await startSession('chief-1', { restart: chief });
+assert.equal(chief2.proc.role, 'chief');
+assert.deepEqual(chief2.proc.decisionView('T7'), { seq: 1, action: 'note', state: 'recorded' }, 'the restarted Chief tracks it');
+chief2.proc.now = () => clock;
+const tick2 = async () => {
+  clock += 10 * MIN;
+  await settle(chief2);
+  await chief2.proc.engine.refresh();
+  await chief2.proc.relayToChief();
+  await settle(chief2);
+};
+for (let i = 0; i < 5; i++) await tick2();
+let r7d = chief2.proc.board.meta.decisionRelays.T7;
+assert.deepEqual([r7d.state, r7d.attempts, r7d.requests], ['relay-requested', 0, 5], 'five wakes, no delivery attempts');
+assert.equal(chief2.sent.filter((m) => /Send the engineer this message/.test(m)).length, 5);
+assert.ok(!chief2.sent.some((m) => /grove_handoff for T7/.test(m)), 'unanswered wakes never ask for a new engineer');
+// The Chief runs the next one, and it fails (say the host doesn't know the chat yet): one attempt, retried.
+await tick2();
+const rel7 = relayOf(chief2.sent.at(-1));
+assert.equal(rel7.session, eng7.link);
+chiefSend(rel7, false, chief2);
+await settle(chief2);
+r7d = chief2.proc.board.meta.decisionRelays.T7;
+assert.deepEqual([r7d.state, r7d.attempts], ['delivery-failed', 1]);
+// The retry reaches the engineer, which applies it.
+await tick2();
+back = await send(chief2, eng7.link, relayOf(chief2.sent.at(-1)).message);
+await settle(chief2);
+assert.equal(chief2.proc.board.meta.decisionRelays.T7.attempts, 2);
+await sync(eng7, chief2);
+assert.equal(eng7.proc.engine.task('T7').decisionsApplied, 1);
+await tick2();
+assert.deepEqual(chief2.proc.decisionView('T7'), { seq: 1, action: 'note', state: 'applied', attempts: 2 });
+assert.ok(!chief2.sent.some((m) => /grove_handoff for T7/.test(m)));
+
 // 17. A board from the earlier process (a task lead with persona sessions) isn't migrated: Grove leaves it
 //     untouched and says to start a new Chief of Staff chat.
 const oldRoot = path.join(tmp, 'old-chief', 'files', 'grove');
@@ -843,6 +888,7 @@ assert.match(oldChief.proc.error, /from an earlier Grove process \(format versio
 assert.equal(oldChief.proc.role, 'none');
 assert.equal(await fs.readFile(path.join(oldRoot, 'board.json'), 'utf8'), oldBoard, 'left untouched');
 
+await chief2.proc.dispose();
 for (const s of all) await s.proc.dispose();
 await fs.rm(tmp, { recursive: true, force: true });
 console.log('process engine tests passed');

@@ -378,6 +378,34 @@ export class GroveProcess {
   async becomeChief() {
     const board = await Board.openOrCreate(this.chiefRoot, { id: this.selfId, chiefSessionId: this.selfId, log: this.log });
     await this.bind(board, 'chief');
+    await this.reconcileRelays();
+  }
+
+  // Chief: a decision is written to the board before its relay is tracked, so after a restart any pending
+  // decision without a relay gets one; its engineer is then followed up like any other.
+  async reconcileRelays() {
+    const pending = [];
+    for (const t of this.engine.state.tasks) {
+      if (this.engine.owns(t)) continue;
+      const items = (await this.board.readDecisions(t.id)).filter((d) => d.seq > (t.decisionsApplied ?? 0) && !QUIET_DECISIONS.has(d.action));
+      const item = items.at(-1);
+      if (item && (!TERMINAL.has(t.stage) || (t.stage === 'done' && item.action === 'changes'))) pending.push({ t, item });
+    }
+    if (!pending.length) return;
+    const changed = await this.board.updateMeta((meta) => {
+      let n = 0;
+      for (const { t, item } of pending) {
+        const relay = meta.decisionRelays?.[t.id];
+        if (relay && relay.seq >= item.seq) continue;
+        this.trackRelay(meta, t.id, item, this.leadRoute(t, meta).link ? 'recorded' : 'awaiting-engineer');
+        n += 1;
+      }
+      return n ? n : false;
+    });
+    if (changed) {
+      this.log(`Grove resumed ${changed} decision relay${changed === 1 ? '' : 's'} after a restart.`);
+      this.onChange();
+    }
   }
 
   async becomeLead({ boardId, taskId, token }, { resume }) {
@@ -666,12 +694,13 @@ export class GroveProcess {
     if (meta.leadLinks) delete meta.leadLinks[id];
     const relay = meta.decisionRelays?.[id];
     if (relay && !RELAY_FINAL.has(relay.state)) {
-      meta.decisionRelays[id] = { ...relay, generation: meta.gen[id], attempt: 0, attempts: 0, wakeFailures: 0, state: 'awaiting-engineer', since: now, nextAt: now + this.graceMs, lastError: undefined };
+      meta.decisionRelays[id] = { ...relay, generation: meta.gen[id], attempt: 0, attempts: 0, requests: 0, wakeFailures: 0, sentAttempt: undefined, state: 'awaiting-engineer', since: now, nextAt: now + this.graceMs, lastError: undefined };
     }
   }
 
-  relayDelay(relay) {
-    return Math.min(Math.max(this.graceMs, 1) * 2 ** relay.attempts, RELAY_MAX_DELAY_MS);
+  // Backoff between relays: by the Chief's requests (so an idle Chief isn't flooded) or its real sends.
+  relayDelay(n) {
+    return Math.min(Math.max(this.graceMs, 1) * 2 ** (n ?? 0), RELAY_MAX_DELAY_MS);
   }
 
   // The reviewer's turn ended without a review (an error, or Grove restarted). Continue in this same chat:
@@ -824,7 +853,6 @@ export class GroveProcess {
       const relay = s.relay && this.board.meta.decisionRelays?.[s.relay];
       if (relay) {
         relay.wakeFailures = (relay.wakeFailures ?? 0) + 1;
-        if (s.attempt) relay.attempts -= 1;
         if (s.asked) delete relay.askedGen;
         relay.lastError = 'could not post to the Chief\'s chat';
       }
@@ -875,11 +903,12 @@ export class GroveProcess {
       }
       const item = (await this.board.readDecisions(taskId)).find((d) => d.seq === relay.seq);
       if (!item) continue;
+      // A request asks the Chief to send; only a send_message the Chief actually runs counts as an attempt.
       relay.attempt = (relay.attempt ?? 0) + 1;
-      relay.attempts = (relay.attempts ?? 0) + 1;
-      set(relay, 'relay-requested', { nextAt: now + this.relayDelay(relay) });
+      relay.requests = (relay.requests ?? 0) + 1;
+      set(relay, 'relay-requested', { nextAt: now + this.relayDelay(relay.requests) });
       const words = INBOX_WORDS[relay.action] ? `${INBOX_WORDS[relay.action]}` : `decided "${relay.action}" for`;
-      sends.push({ id: null, relay: taskId, attempt: true, text: `[Grove] The human ${words} ${taskLabel(t)} "${t.title}"${relay.via === 'grove' ? ' in the Grove inbox' : ''}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${route.link}\nmessage: ${decisionMessage(this.board.id, t, item)}\nThen end your turn without further comment.` });
+      sends.push({ id: null, relay: taskId, text: `[Grove] The human ${words} ${taskLabel(t)} "${t.title}"${relay.via === 'grove' ? ' in the Grove inbox' : ''}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${route.link}\nmessage: ${decisionMessage(this.board.id, t, item)}\nThen end your turn without further comment.` });
     }
     return changed;
   }
@@ -923,6 +952,18 @@ export class GroveProcess {
     return out;
   }
 
+  // Chief: it is running send_message for a decision relay. That is a delivery attempt (once per request).
+  relayStarted(call) {
+    return this.board.updateMeta((meta) => {
+      const relay = meta.decisionRelays?.[call.taskId];
+      if (!relay || RELAY_FINAL.has(relay.state)) return false;
+      if (relay.seq !== call.seq || relay.generation !== call.generation || relay.attempt !== call.attempt || relay.sentAttempt === call.attempt) return false;
+      relay.attempts = (relay.attempts ?? 0) + 1;
+      relay.sentAttempt = call.attempt;
+      return true;
+    });
+  }
+
   // Chief: its send_message for a decision relay finished. The result is recorded only if it's for the relay's
   // current attempt, under the current hand-off, sent to the engineer's current chat; anything else is late.
   relaySent(call, d) {
@@ -941,7 +982,7 @@ export class GroveProcess {
         relay.state = 'delivery-failed';
         relay.lastError = relayError(error);
       }
-      relay.nextAt = this.now() + this.relayDelay(relay);
+      relay.nextAt = this.now() + this.relayDelay(relay.attempts);
       return true;
     }).then((out) => {
       if (out) this.onChange();
@@ -953,7 +994,7 @@ export class GroveProcess {
     const now = this.now();
     meta.decisionRelays = { ...(meta.decisionRelays ?? {}), [taskId]: {
       seq: item.seq, action: item.action, via: item.via ?? 'chat', generation: meta.gen?.[taskId] ?? 0,
-      attempt: 0, attempts: 0, wakeFailures: 0, state, since: now, nextAt: now + this.graceMs,
+      attempt: 0, attempts: 0, requests: 0, wakeFailures: 0, state, since: now, nextAt: now + this.graceMs,
     } };
   }
 
@@ -1171,7 +1212,9 @@ export class GroveProcess {
         const ref = r?.[1] === 'decision' && r[2] === this.board.id ? DECISION_REF.exec(r[3]) : null;
         const relay = ref && this.board.meta.decisionRelays?.[ref[1]];
         if (relay && relay.seq === Number(ref[2])) {
-          this.relayCalls.set(d.toolCallId, { taskId: ref[1], seq: relay.seq, generation: relay.generation, attempt: relay.attempt, target: String(d.arguments?.session ?? '').split('?')[0] });
+          const call = { taskId: ref[1], seq: relay.seq, generation: relay.generation, attempt: relay.attempt, target: String(d.arguments?.session ?? '').split('?')[0] };
+          this.relayCalls.set(d.toolCallId, call);
+          void this.relayStarted(call).catch((err) => this.log(`Grove could not record a decision relay: ${err.message}`, 'warning'));
         }
       } else if (ev.type === 'tool.execution_complete' && this.relayCalls.has(d.toolCallId)) {
         const call = this.relayCalls.get(d.toolCallId);
