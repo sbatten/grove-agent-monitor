@@ -30,6 +30,19 @@ function ago(ts) {
 }
 
 // The book sprite in the task's colour, drawn at art size and scaled up crisply by CSS.
+const DECISION_PENDING = new Set(['recorded', 'relay-requested', 'delivery-accepted', 'delivery-failed', 'awaiting-engineer', 'needs-new-engineer']);
+
+// Where the human's latest inbox decision has got to, in words. Null once it's applied.
+function decisionLine(d) {
+  if (!d) return null;
+  if (['recorded', 'relay-requested', 'delivery-accepted'].includes(d.state)) return 'Sent to engineer · waiting';
+  if (d.state === 'delivery-failed') return `Retrying delivery (${d.attempts ?? 1})`;
+  if (d.state === 'awaiting-engineer') return 'Waiting for new engineer';
+  if (d.state === 'needs-new-engineer') return 'Engineer not reachable · Chief asked for a new engineer';
+  if (d.state === 'rejected' || d.state === 'superseded') return `Not applied: ${d.reason ?? d.state}`;
+  return null;
+}
+
 function bookIcon(color) {
   const c = el('canvas', { width: '14', height: '16', class: 'book-icon', 'aria-hidden': 'true' });
   drawSprite(c.getContext('2d'), 'book', 7, 15, { anim: 'glow', variant: color, tick: 0 });
@@ -171,9 +184,11 @@ export class InboxPanel {
     return this.act(t.id, 'dismiss', () => this.api('api/inbox/decide', { taskId: t.id, action: 'dismiss' }), () => this.onStatus(`${t.name ?? t.id} dismissed: the task is cancelled.`));
   }
 
-  buttons(t, { ask, shelved = false }) {
+  buttons(t, { ask, shelved = false, decision = null }) {
     const inbox = this.process.inbox;
     const busy = this.busy.has(t.id);
+    // The same answer is already on its way to the engineer: don't send it twice. Dismiss stays available.
+    const pending = DECISION_PENDING.has(decision?.state) ? decision.action : null;
     const confirming = this.confirming.has(t.id);
     const who = t.name ? `${t.name} (${t.id})` : t.id;
     const out = [];
@@ -195,11 +210,11 @@ export class InboxPanel {
       }
       // Blockers are answered through the Chief of Staff (attach the task and say it's done), not a button.
       if (shelved) { /* no other answers here: bring it back, or attach it and tell the Chief */ } else if (ask?.kind === 'merge') {
-        out.push(el('button', { type: 'button', class: 'act act-complete', disabled: busy, 'aria-label': `Merge ${who}'s pull request`, title: 'The team merges the pull request (without bypassing checks or reviews)', onclick: () => this.merge(t) }, '⇢ Merge'));
+        out.push(el('button', { type: 'button', class: 'act act-complete', disabled: busy || pending === 'merge', 'aria-label': `Merge ${who}'s pull request`, title: 'The team merges the pull request (without bypassing checks or reviews)', onclick: () => this.merge(t) }, '⇢ Merge'));
       } else if (ask && ask.kind !== 'blocked') {
         const accept = ask.kind === 'input';
         const ships = ask.kind === 'sign-off' && /PR/.test(ask.label);
-        out.push(el('button', { type: 'button', class: 'act act-complete', disabled: busy, 'aria-label': `${accept ? 'Accept' : ships ? 'Approve' : 'Complete'} ${who}`, title: accept ? 'Accept the stuck step as it is; the team carries on' : ships ? 'Approve the change: the team opens a pull request, and Grove watches it until it\'s ready to merge' : 'Sign off: the task is done', onclick: () => this.complete(t) }, accept ? '✓ Accept' : ships ? '✓ Approve' : '✓ Complete'));
+        out.push(el('button', { type: 'button', class: 'act act-complete', disabled: busy || pending === 'approve', 'aria-label': `${accept ? 'Accept' : ships ? 'Approve' : 'Complete'} ${who}`, title: accept ? 'Accept the stuck step as it is; the team carries on' : ships ? 'Approve the change: the team opens a pull request, and Grove watches it until it\'s ready to merge' : 'Sign off: the task is done', onclick: () => this.complete(t) }, accept ? '✓ Accept' : ships ? '✓ Approve' : '✓ Complete'));
       }
       if (ask) {
         out.push(el('button', { type: 'button', class: 'act act-shelve', disabled: busy, 'aria-label': `Shelve ${who}`, title: 'Not now: set it aside for later. It leaves your inbox, its engineer rests, and everything is kept until you bring it back.', onclick: () => this.shelve(t) }, '⤓ Shelve'));
@@ -210,7 +225,8 @@ export class InboxPanel {
   }
 
   // One task as a full-width row: its book (the report), what it is and needs, and its actions.
-  row({ t, color, kind, report, label, labelClass, meta = [], ask, summary, buttons }) {
+  row({ t, color, kind, report, label, labelClass, meta = [], ask, summary, decision, buttons }) {
+    const line = decisionLine(decision);
     const id = t.id;
     return el('li', { class: `row row-${kind}`, style: { '--task': PALETTE[color] ?? PALETTE.uiText } },
       report
@@ -221,7 +237,8 @@ export class InboxPanel {
         el('div', { class: 'row-title', text: t.title }),
         el('div', { class: 'row-meta' }, label ? el('span', { class: `row-kind ${labelClass ?? ''}`, text: label }) : null, ...meta),
         ask ? el('p', { class: 'row-ask', text: ask }) : null,
-        summary ? el('p', { class: 'row-summary', text: summary }) : null),
+        summary ? el('p', { class: 'row-summary', text: summary }) : null,
+        line ? el('p', { class: `row-decision decision-${decision.state}`, role: 'status', text: line }) : null),
       el('div', { class: 'row-actions' }, buttons.map((b) => { b.setAttribute('data-focus', `${b.className}-${id}`); return b; })));
   }
 
@@ -241,7 +258,7 @@ export class InboxPanel {
     const shelved = new Set(shelf.map((x) => x.taskId));
     const active = (p.tasks ?? []).filter((t) => !FINISHED.has(t.stage) && !waiting.has(t.id) && !shelved.has(t.id));
     const attached = p.inbox.attached ?? [];
-    const key = JSON.stringify([items, active.map((t) => [t.id, t.name, t.stageLabel, t.title, t.updates?.at(-1)?.text]), shelf, p.inbox.canDecide, p.inbox.canAttach, attached, [...this.confirming.keys()], [...this.busy]]);
+    const key = JSON.stringify([items, active.map((t) => [t.id, t.name, t.stageLabel, t.title, t.updates?.at(-1)?.text, t.decision]), shelf, p.inbox.canDecide, p.inbox.canAttach, attached, [...this.confirming.keys()], [...this.busy]]);
     if (!force && key === this.key) return;
     this.key = key;
     const focused = document.activeElement && this.root.contains(document.activeElement) ? document.activeElement.getAttribute('data-focus') : null;
@@ -261,13 +278,13 @@ export class InboxPanel {
           a.pr ? el('a', { class: 'pr-link', href: a.pr, target: '_blank', rel: 'noopener', text: a.kind === 'sign-off' ? 'Draft PR ↗' : 'Open PR ↗' }) : null,
           a.since ? el('span', { text: ago(a.since) }) : null,
         ],
-        ask: a.ask, summary: a.summary, buttons: this.buttons(t, { ask: a }),
+        ask: a.ask, summary: a.summary, decision: a.decision, buttons: this.buttons(t, { ask: a, decision: a.decision }),
       });
     });
     const runRows = active.map((t) => this.row({
       t, color: t.color, kind: 'run', report: null,
       label: t.engineer === 'pending' ? 'Waiting for its engineer' : t.stageLabel,
-      summary: t.updates?.at(-1)?.text ?? '', buttons: this.buttons(t, { ask: null }),
+      summary: t.updates?.at(-1)?.text ?? '', decision: t.decision, buttons: this.buttons(t, { ask: null, decision: t.decision }),
     }));
     const shelfRows = shelf.map((x) => this.row({
       t: { id: x.taskId, name: x.name, title: x.title }, color: x.color, kind: 'shelved', report: x.report,

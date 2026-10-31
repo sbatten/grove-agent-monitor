@@ -204,12 +204,25 @@ export class Board {
     return this.writes;
   }
 
+  // The snapshot is taken when the write runs, so a later queued change is never overwritten by an
+  // earlier, staler snapshot.
   saveMeta() {
+    return this.queue(() => this.writeMeta());
+  }
+
+  async writeMeta() {
     this.meta.updatedAt = Date.now();
-    const snapshot = structuredClone(this.meta);
+    await writeJson(Board.metaFile(this.root), structuredClone(this.meta));
+    await this.link();
+  }
+
+  // Read-modify-write of the meta, serialized with every other board write. `fn` returns false to skip the
+  // write; otherwise its return value is passed back.
+  updateMeta(fn) {
     return this.queue(async () => {
-      await writeJson(Board.metaFile(this.root), snapshot);
-      await this.link();
+      const out = await fn(this.meta);
+      if (out !== false) await this.writeMeta();
+      return out;
     });
   }
 
@@ -307,13 +320,23 @@ export class Board {
 
   // Chief only: append the human's decision for the task's owner to apply.
   // `via` is 'grove' when the human decided in the canvas inbox rather than in the Chief's chat.
-  async appendDecision(taskId, { action, note, via = 'chat', ship, workspaceRepair }) {
-    const items = await this.readDecisions(taskId);
-    const item = { seq: (items.at(-1)?.seq ?? 0) + 1, action, note, via, at: Date.now(),
-      ...(ship !== undefined ? { ship } : {}), ...(workspaceRepair ? { workspaceRepair } : {}) };
-    items.push(item);
-    await this.queue(() => writeJson(this.decisionsFile(taskId), { format: FORMATS.decisions, version: VERSION, task: taskId, items }));
-    return item;
+  // Read, dedupe and write run as one queued job, so two clicks can't both read the same last seq. An inbox
+  // click identical to one still waiting to be applied (seq > appliedThrough) isn't appended twice. Chat
+  // decisions and workspace-repair grants are deliberate and always appended: the caller's appliedThrough can
+  // lag the owner's save, so deduping them could silently drop a repeated, already-applied decision.
+  appendDecision(taskId, { action, note, via = 'chat', ship, workspaceRepair }, { appliedThrough = 0 } = {}) {
+    return this.queue(async () => {
+      const items = await this.readDecisions(taskId);
+      const same = via === 'grove' && !workspaceRepair && items.find((d) => d.seq > appliedThrough
+        && d.action === action && d.via === via && (d.note ?? null) === (note ?? null) && d.ship === ship
+        && !d.workspaceRepair);
+      if (same) return { item: same, duplicate: true };
+      const item = { seq: (items.at(-1)?.seq ?? 0) + 1, action, note, via, at: Date.now(),
+        ...(ship !== undefined ? { ship } : {}), ...(workspaceRepair ? { workspaceRepair } : {}) };
+      items.push(item);
+      await writeJson(this.decisionsFile(taskId), { format: FORMATS.decisions, version: VERSION, task: taskId, items });
+      return { item, duplicate: false };
+    });
   }
 
   // Cheap change detector: names + mtimes of every board file.
