@@ -411,6 +411,10 @@ const hooked = (eng) => async (m) => (await eng.hooks.onUserPromptSubmitted({ pr
   const res = await broken.relay(r);
   assert.deepEqual(res, [{ action: 'rejected', reason: 'providerError' }], 'one attempt, no queued resend');
   assert.deepEqual(broken.trace.map((e) => e.event), ['rejected']);
+  const fenced = new RelayHost();
+  fenced.add(eng.link, hooked(eng), { active: true, reject: 'credentialBoundary' });
+  assert.deepEqual(await fenced.relay(r), [{ action: 'rejected', reason: 'credentialBoundary' }], 'the host\'s refusal holds');
+  assert.deepEqual(fenced.trace.map((e) => e.event), ['rejected']);
   const busy = new RelayHost();
   busy.add(eng.link, hooked(eng), { active: true });
   await busy.relay(r);
