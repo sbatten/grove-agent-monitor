@@ -872,6 +872,11 @@ const t8id = res.data.task?.id ?? 'T8';
 assert.ok(chief.proc.engine.owns(chief.proc.engine.task(t8id)), 'unclaimed: the Chief owns it');
 await chief.proc.board.appendDecision(t8id, { action: 'cancel', via: 'grove' }, { appliedThrough: 0 });
 assert.equal(chief.proc.engine.task(t8id).decisionsApplied ?? 0, 0, 'written, not applied');
+// A shelve sends no message, but it still has to reach its engineer: written before tracking, it is tracked
+// after the restart too.
+const t5d = chief.proc.engine.task('T5');
+const { item: shelf5 } = await chief.proc.board.appendDecision('T5', { action: 'shelve', via: 'grove' }, { appliedThrough: t5d.decisionsApplied ?? 0 });
+assert.notEqual(chief.proc.board.meta.decisionRelays?.T5?.seq, shelf5.seq, 'not tracked before the restart');
 await chief.proc.dispose();
 const chief2 = await startSession('chief-1', { restart: chief });
 assert.equal(chief2.proc.role, 'chief');
@@ -881,6 +886,12 @@ await settle(chief2);
 const disk8 = (await chief2.proc.board.readTasks()).find((x) => x.id === t8id);
 assert.deepEqual([disk8.stage, disk8.decisionsApplied], ['cancelled', 1], 'and saves it');
 assert.equal(chief2.proc.board.meta.decisionRelays?.[t8id], undefined, 'nothing to relay: no engineer');
+assert.deepEqual(chief2.proc.decisionView('T5'), { seq: shelf5.seq, action: 'shelve', state: 'recorded' }, 'the restarted Chief tracks the quiet shelve too');
+await sync(eng5, chief2);
+assert.equal(eng5.proc.engine.task('T5').decisionsApplied, shelf5.seq, 'its engineer applies it');
+await chief2.proc.relayToChief();
+await settle(chief2);
+assert.equal(chief2.proc.decisionView('T5').state, eng5.proc.engine.task('T5').decisionResults.at(-1).result, 'and the relay converges');
 assert.deepEqual(chief2.proc.decisionView('T7'), { seq: 1, action: 'note', state: 'recorded' }, 'the restarted Chief tracks it');
 chief2.proc.now = () => clock;
 const tick2 = async () => {

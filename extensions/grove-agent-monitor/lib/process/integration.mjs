@@ -392,7 +392,8 @@ export class GroveProcess {
         if (applied?.length) this.log(`Grove applied ${applied.length} outstanding decision${applied.length === 1 ? '' : 's'} on ${t.id} after a restart.`);
         continue;
       }
-      const items = (await this.board.readDecisions(t.id)).filter((d) => d.seq > (t.decisionsApplied ?? 0) && !QUIET_DECISIONS.has(d.action));
+      // Quiet decisions (shelve) skip the immediate message, not tracking: the engineer still has to apply them.
+      const items = (await this.board.readDecisions(t.id)).filter((d) => d.seq > (t.decisionsApplied ?? 0));
       const item = items.at(-1);
       if (item && (!TERMINAL.has(t.stage) || (t.stage === 'done' && item.action === 'changes'))) pending.push({ t, item });
     }
