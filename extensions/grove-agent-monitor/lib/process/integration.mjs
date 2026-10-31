@@ -381,12 +381,17 @@ export class GroveProcess {
     await this.reconcileRelays();
   }
 
-  // Chief: a decision is written to the board before its relay is tracked, so after a restart any pending
-  // decision without a relay gets one; its engineer is then followed up like any other.
+  // Chief: a decision is written to the board before it is applied or its relay tracked, so after a restart
+  // any decision on a task the Chief still owns is applied here, and any pending decision without a relay
+  // gets one; its engineer is then followed up like any other.
   async reconcileRelays() {
     const pending = [];
     for (const t of this.engine.state.tasks) {
-      if (this.engine.owns(t)) continue;
+      if (this.engine.owns(t)) {
+        const applied = this.engine.applyDecisions(t, await this.board.readDecisions(t.id));
+        if (applied?.length) this.log(`Grove applied ${applied.length} outstanding decision${applied.length === 1 ? '' : 's'} on ${t.id} after a restart.`);
+        continue;
+      }
       const items = (await this.board.readDecisions(t.id)).filter((d) => d.seq > (t.decisionsApplied ?? 0) && !QUIET_DECISIONS.has(d.action));
       const item = items.at(-1);
       if (item && (!TERMINAL.has(t.stage) || (t.stage === 'done' && item.action === 'changes'))) pending.push({ t, item });

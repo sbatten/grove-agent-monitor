@@ -713,10 +713,10 @@ const relayTick = async (mins = 10) => {
 };
 const relayOf = (text) => ({ session: /\nsession: (\S+)\n/.exec(text)[1], message: /\nmessage: ([\s\S]*?)\nThen end your turn/.exec(text)[1] });
 let rtc = 0;
-const chiefSend = (args, outcome, c = chief) => {
+const chiefSend = (args, outcome, c = chief, failure = 'Session not found') => {
   const toolCallId = `relay-${++rtc}`;
   c.emit({ type: 'tool.execution_start', data: { toolCallId, toolName: 'send_message', arguments: args } });
-  const finish = (ok) => c.emit({ type: 'tool.execution_complete', data: ok ? { toolCallId, success: true, result: { content: '{"action":"started"}' } } : { toolCallId, success: false, error: { message: `Session not found (${args.session}?token=secret)` } } });
+  const finish = (ok) => c.emit({ type: 'tool.execution_complete', data: ok ? { toolCallId, success: true, result: { content: '{"action":"started"}' } } : { toolCallId, success: false, error: { message: `${failure} (${args.session}?token=secret)` } } });
   if (outcome !== undefined) finish(outcome);
   return finish;
 };
@@ -864,9 +864,23 @@ for (const tok of tokens) assert.ok(!shown.includes(tok), 'no hand-off token in 
 const t7d = chief.proc.engine.task('T7');
 await chief.proc.board.appendDecision('T7', { action: 'note', note: 'Count forks too.', via: 'chat' }, { appliedThrough: t7d.decisionsApplied ?? 0 });
 assert.equal(chief.proc.decisionView('T7'), null, 'the Chief went away before tracking it');
+// A task no engineer has claimed yet is the Chief's own: a dismissal written just before the restart is
+// applied by the restarted Chief, not left pending.
+res = await chief.call('grove_create_task', { title: 'Tidy labels', goal: 'Tidy the issue labels.', kind: 'other', destination: { mode: 'scratch' } });
+await settle(chief);
+const t8id = res.data.task?.id ?? 'T8';
+assert.ok(chief.proc.engine.owns(chief.proc.engine.task(t8id)), 'unclaimed: the Chief owns it');
+await chief.proc.board.appendDecision(t8id, { action: 'cancel', via: 'grove' }, { appliedThrough: 0 });
+assert.equal(chief.proc.engine.task(t8id).decisionsApplied ?? 0, 0, 'written, not applied');
 await chief.proc.dispose();
 const chief2 = await startSession('chief-1', { restart: chief });
 assert.equal(chief2.proc.role, 'chief');
+const t8 = chief2.proc.engine.task(t8id);
+assert.deepEqual([t8.stage, t8.decisionsApplied], ['cancelled', 1], 'the restarted Chief applies its own task\'s dismissal');
+await settle(chief2);
+const disk8 = (await chief2.proc.board.readTasks()).find((x) => x.id === t8id);
+assert.deepEqual([disk8.stage, disk8.decisionsApplied], ['cancelled', 1], 'and saves it');
+assert.equal(chief2.proc.board.meta.decisionRelays?.[t8id], undefined, 'nothing to relay: no engineer');
 assert.deepEqual(chief2.proc.decisionView('T7'), { seq: 1, action: 'note', state: 'recorded' }, 'the restarted Chief tracks it');
 chief2.proc.now = () => clock;
 const tick2 = async () => {
@@ -885,10 +899,11 @@ assert.ok(!chief2.sent.some((m) => /grove_handoff for T7/.test(m)), 'unanswered 
 await tick2();
 const rel7 = relayOf(chief2.sent.at(-1));
 assert.equal(rel7.session, eng7.link);
-chiefSend(rel7, false, chief2);
+chiefSend(rel7, false, chief2, 'Unknown chat owner');
 await settle(chief2);
 r7d = chief2.proc.board.meta.decisionRelays.T7;
 assert.deepEqual([r7d.state, r7d.attempts], ['delivery-failed', 1]);
+assert.match(chief2.proc.decisionView('T7').reason, /Unknown chat owner/);
 // A send queued for a chat that no longer holds T7 is refused, and Grove re-targets at once (no backoff).
 await tick2();
 const stale7 = relayOf(chief2.sent.at(-1)).message;
