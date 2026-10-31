@@ -12,8 +12,9 @@ export class RelayHost {
   }
 
   // `onPrompt(message)` is what the chat sees when a message is delivered (the user-prompt hook, when on).
-  add(link, onPrompt, { active = false, hookEnabled = true } = {}) {
-    this.chats.set(link, { link, onPrompt, active, hookEnabled, queue: [], steer: null, seen: [] });
+  // `reject` makes every send to the chat fail with that reason (e.g. a provider error).
+  add(link, onPrompt, { active = false, hookEnabled = true, reject = null } = {}) {
+    this.chats.set(link, { link, onPrompt, active, hookEnabled, reject, queue: [], steer: null, seen: [] });
   }
 
   log(event, link, detail = {}) {
@@ -23,6 +24,10 @@ export class RelayHost {
   async send({ session, message, delivery = 'queue' }) {
     const c = this.chats.get(session);
     if (!c) throw new Error(`unknown chat ${session}`);
+    if (c.reject) {
+      this.log('rejected', session, { delivery, reason: c.reject });
+      return { action: 'rejected', reason: c.reject };
+    }
     if (delivery === 'steer') {
       if (!c.active) {
         this.log('rejected', session, { delivery, reason: 'cannotSteer' });

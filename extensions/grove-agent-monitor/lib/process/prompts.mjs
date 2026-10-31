@@ -339,6 +339,7 @@ export function memberRevive(ticket, why) {
 // every decision the engineer hasn't read yet; grove_next has their full text.
 export function engineerWake(task, decisions) {
   const list = (Array.isArray(decisions) ? decisions : [decisions]).filter(Boolean);
+  if (!list.length) return `[Grove] The human decided something for ${taskLabel(task)}. The task is now "${stageLabel(task)}". ${GO_NEXT}: its "decisions" field has the full text. Then do what it says.`;
   const lines = list.map((d) => `- #${d.seq} ${DECISION_WORDS[d.action] ?? d.action} (${d.via === 'grove' ? 'in the Grove inbox' : 'relayed by the Chief of Staff'})${d.note ? `: "${notePreview(d.note)}"` : ''}`);
   const last = list.at(-1);
   const next = last?.action === 'hold' ? ' Read them, then do nothing more: everyone has stopped; end your turn.'

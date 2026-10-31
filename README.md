@@ -342,8 +342,10 @@ you ──► Chief of Staff ──► T1 engineer ── plan · execute · ver
   Grove checks its verdict, writes it to the board, and has the reviewer
   **report to the engineer with `send_message`**. The report steers the
   engineer's active turn (`delivery: "steer"`), or, if the engineer is idle
-  (`rejected`/`cannotSteer`), is resent queued and starts its next turn. The engineer's Grove applies it (the engineer's session is the
-  only writer of task state).
+  (the host answers with action `rejected` and reason `cannotSteer`), is
+  resent queued and starts its next turn; any other result is not resent.
+  The engineer's Grove applies it (the engineer's session is the only writer
+  of task state).
 - **Up:** when a task needs you (a delivered result, an escalation, a
   blocker), the engineer **messages the Chief** (`grove_next` lists the
   message). Grove attaches the full details to that turn, and the Chief relays

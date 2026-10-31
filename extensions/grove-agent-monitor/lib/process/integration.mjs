@@ -36,7 +36,7 @@ import {
 import { execFile } from 'node:child_process';
 import {
   briefFor, hireInstruction, engineerHandoff, engineerBrief, engineerContext, engineerWake, relayDelivery, DELIVERY_FALLBACK, stepAssignment, chiefNotice, chiefAnswer,
-  memberContext, memberRevive, LEAD_MARKER, MEMBER_MARKER, RELAY_MARKER, reportMessage, noticeMessage, decisionMessage,
+  memberContext, memberRevive, LEAD_MARKER, MEMBER_MARKER, RELAY_MARKER, reportMessage, noticeMessage, decisionMessage, defang,
 } from './prompts.mjs';
 import { validateEvidence } from './evidence.mjs';
 import { memberModel, engineerModel } from './models.mjs';
@@ -294,6 +294,9 @@ export class GroveProcess {
     this.warned = new Set();
     this.outbox = [];
     this.wokenFor = new Map(); // engineer: pending item id → times this session was woken for it
+    // Engineer: reports Grove recorded from the board before the engineer saw them (in grove_next or their relay).
+    // The poll can close a round before the round-closing report's relay lands; that relay is still news.
+    this.unseenReports = new Set();
     this.inboxLog = []; // chief: what the human decided in the Grove inbox since the Chief's last turn
     this.inboxPending = new Map(); // chief: task id → inbox decision its engineer hasn't applied yet
     this.attached = new Map(); // chief: task id → when the human attached it to their next message
@@ -681,7 +684,10 @@ export class GroveProcess {
     if (!open.size) return n;
     for (const r of await this.board.readResults()) {
       if (!open.has(r.ticket)) continue;
-      if (await this.engine.applyResult(r)) n += 1;
+      if (await this.engine.applyResult(r)) {
+        n += 1;
+        this.unseenReports.add(r.ticket);
+      }
     }
     return n;
   }
@@ -1217,23 +1223,32 @@ export class GroveProcess {
     if (kind === 'report' && this.role === 'lead') {
       const before = this.leadTask();
       if (!before) return null;
+      if (!before.tickets.some((k) => k.id === ref)) {
+        return `${engineerContext(before, { initial: false })} Grove has no reviewer report ${ref} for ${before.id}: nothing new. Carry on with what you were doing.`;
+      }
       // A steered report can land in the middle of later work: one from a round that's over, whose result
       // Grove already recorded, must not pull the engineer off what it's doing now.
-      const stale = this.engine.staleTicket(before, ref);
+      // One Grove recorded from the board but the engineer hasn't seen yet (it may have closed the round) is not.
+      const stale = this.engine.staleTicket(before, ref) && !this.unseenReports.has(ref);
       const n = await this.collectResults();
+      this.unseenReports.delete(ref);
       const task = this.leadTask();
       if (!task) return null;
-      if (stale && !n && !(await this.unreadDecisions(task)).length) {
-        return `${engineerContext(task, { initial: false })} This reviewer report is from an earlier review round, and Grove already recorded it. Carry on with what you were doing.`;
+      if (stale && !n && !(await this.hasUnreadDecisions(task))) {
+        return `${engineerContext(task, { initial: false })} This reviewer report is from a review round Grove already recorded and closed. If you haven't seen how that round ended in grove_next, call grove_next now; otherwise carry on with what you were doing.`;
       }
       return `${engineerContext(task, { initial: false })} A reviewer reported back${n ? '; Grove recorded it' : ''}. Call grove_next now: its "reviews" field has the full review. Then do what it says.`;
     }
     if (kind === 'decision' && this.role === 'lead') {
       const task0 = this.leadTask();
-      if (!task0 || !new RegExp(`^${task0.id}:(\\d+)$`).test(ref)) return null;
+      const m = task0 && new RegExp(`^${task0.id}:(\\d+)$`).exec(ref);
+      if (!m) return null;
       await this.applyLeadDecisions();
       const task = this.leadTask();
       if (!task) return null;
+      let known = true;
+      try { known = (await this.board.readDecisions(task.id)).some((d) => d.seq === Number(m[1])); } catch { /* unsure: point at grove_next */ }
+      if (!known) return `${engineerContext(task, { initial: false })} Grove has no decision #${m[1]} for ${task.id}: nothing new. Carry on with what you were doing.`;
       return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now: its "decisions" field has the full decision. Then do what it says.`;
     }
     if (kind === 'notice' && this.role === 'chief') {
@@ -1860,7 +1875,11 @@ export class GroveProcess {
     if (!task) throw new ProcessError('invalid_state', 'This chat is not working on a Grove task.');
     await this.collectResults();
     // Apply decisions here too, in case their relay hasn't arrived (or never does): the engineer is reading now.
-    if (this.engine.owns(task) && this.engine.applyDecisions(task, await this.board.readDecisions(task.id)).length) {
+    // (Not through applyLeadDecisions: that wakes the engineer, which is already here reading.)
+    let decisionsError = null;
+    let board;
+    try { board = this.engine.owns(task) ? await this.board.readDecisions(task.id) : null; } catch (e) { decisionsError = e?.code ?? 'storage_failed'; }
+    if (board && this.engine.applyDecisions(task, board).length) {
       this.stopBlocks = 0;
       await this.writeTaskReport(task);
     }
@@ -1883,8 +1902,8 @@ export class GroveProcess {
     const waitingHires = task.tickets.filter((k) => k.status === 'issued' && k.retryAt > Date.now());
     if (TERMINAL.has(task.stage)) guidance = `${task.id} is ${stageLabel(task)}. Nothing more to do here.`;
     else if (task.stage === 'shelved') guidance = `${task.id} is on the shelf: the human set it aside for later. Do nothing more: end your turn. When they pick it up again, the Chief of Staff messages this chat (or Grove wakes it).`;
-    else if (task.stage === 'on-hold') guidance = `${task.id} is on hold: the human stopped the work${task.pause?.note ? ` ("${task.pause.note}")` : ''}. Do nothing more: end your turn. The Chief of Staff messages this chat when the human resumes it.`;
-    else if (task.stage === 'blocked' && !messages.length) guidance = `${task.id} is blocked until the human does this: ${task.pause?.need}. The Chief of Staff has been told. Do nothing more: end your turn. Work picks up here when they've done it.`;
+    else if (task.stage === 'on-hold') guidance = `${task.id} is on hold: the human stopped the work${task.pause?.note ? ` ("${defang(task.pause.note)}")` : ''}. Do nothing more: end your turn. The Chief of Staff messages this chat when the human resumes it.`;
+    else if (task.stage === 'blocked' && !messages.length) guidance = `${task.id} is blocked until the human does this: ${defang(task.pause?.need)}. The Chief of Staff has been told. Do nothing more: end your turn. Work picks up here when they've done it.`;
     else if (hires.length || messages.length) guidance = 'Do everything below now, in one turn: make each reviewer hire with the given tool (create_session or send_message), and send each message with send_message, all with exactly the given fields. Then end your turn; reviewers report back to this chat.';
     else if (working) {
       work = stepAssignment(task, working, { evidenceDir: this.engine.stepEvidenceDir(task, working) });
@@ -1898,19 +1917,27 @@ export class GroveProcess {
       results = this.resultsFor(task);
       guidance = this.routingGuidance(task);
     }
-    else if (question) guidance = `The human asked: "${question.text}". Answer it with grove_answer (find out what you need first), then send the message it returns to the Chief of Staff.${inFlight.length ? ' Your reviewers are still working; they report back to this chat.' : ''}`;
+    else if (question) guidance = `The human asked: "${defang(question.text)}". Answer it with grove_answer (find out what you need first), then send the message it returns to the Chief of Staff.${inFlight.length ? ' Your reviewers are still working; they report back to this chat.' : ''}`;
     else if (inFlight.length) guidance = `${step ? `${step.id} is` : 'The work is'} with its reviewers in their own chats. End your turn; they report back to this chat.`;
     else if (SHIPPING_STAGES.has(task.stage)) guidance = `${task.id} is shipping: Grove is watching ${prLine(task.ship.pr)} and wakes you if checks fail, a reviewer asks for changes, or the human needs to decide. End your turn.`;
     else if (WAITING.has(task.stage)) guidance = `${task.id} is waiting on the human (${stageLabel(task)}), and the Chief of Staff has been told. Write a two-line summary and end your turn; the Chief messages this chat when the human decides.`;
     else if (waitingHires.length) guidance = `Hires ${waitingHires.map((k) => k.id).join(', ')} wait until the host's message limit resets (about ${new Date(Math.max(...waitingHires.map((k) => k.retryAt))).toISOString().slice(11, 16)} UTC). End your turn; Grove offers them again then.`;
     else guidance = 'Nothing to do right now.';
-    if (question && !guidance.startsWith('The human asked')) guidance += ` The human also asked: "${question.text}". Answer it with grove_answer once you can.`;
+    if (question && !guidance.startsWith('The human asked')) guidance += ` The human also asked: "${defang(question.text)}". Answer it with grove_answer once you can.`;
     // The full text of what the human decided and what reviewers said: relays only point here, so nothing
     // depends on a relay arriving whole, in order or at all.
     const live = !TERMINAL.has(task.stage);
-    const decisions = live ? await this.decisionsFor(task) : [];
+    let decisions = [];
+    if (live && !decisionsError) {
+      try { decisions = await this.decisionsFor(task); } catch (e) { decisionsError = e?.code ?? 'storage_failed'; }
+    }
     const reviews = live ? await this.reviewsFor(task) : [];
+    const unreadable = reviews.filter((r) => r.error);
     if (decisions.length) guidance = `Read "decisions" first: the human decided something since you last looked${decisions.some((d) => d.historical) ? ' (entries marked historical are from before this list existed: check whether you already acted on them before acting)' : ''}. ${guidance}`;
+    if (live && (decisionsError || unreadable.length)) {
+      const what = [decisionsError ? 'the human\'s decisions' : null, unreadable.length ? `${unreadable.length === 1 ? 'a review' : `${unreadable.length} reviews`} (${unreadable.map((r) => r.ticket).join(', ')})` : null].filter(Boolean).join(' and ');
+      guidance = `Grove couldn't read ${what} in full from the board just now, so what's below is incomplete. Don't continue or submit work that depends on it: call grove_next again in a moment. If this keeps happening, call grove_blocked with what you see. ${guidance}`;
+    }
     const out = { task: task.id, stage: stageLabel(task), guidance, ...(work ? { work } : {}),
       ...(task.destination ? { destination: task.destination, placement: task.placement ?? { status: 'unknown' } } : {}),
       ...(task.workspaceRepair ? { workspaceRepair: {
@@ -1920,9 +1947,21 @@ export class GroveProcess {
         } },
       } } : {}),
       hires, messages: messages.map(({ id, ...m }) => m), inFlight, steps: this.stepsSummary(task), ...(results ? { results } : {}),
-      ...(live ? { decisions, reviews } : {}) };
-    this.consumeDecisions(task, decisions);
+      ...(live ? { decisions, reviews } : {}),
+      ...(decisionsError && live ? { decisionsUnavailable: decisionsError } : {}),
+      ...(unreadable.length ? { reviewsIncomplete: unreadable.map((r) => ({ ticket: r.ticket, error: r.error })) } : {}) };
+    // Seen now: a late relay for any of these reports is no longer news.
+    this.unseenReports.clear();
+    if (!decisionsError) this.consumeDecisions(task, decisions);
     return out;
+  }
+
+  // Engineer: whether there are decisions it hasn't read in grove_next yet. If the board can't be read, assume so.
+  async hasUnreadDecisions(task) {
+    try {
+      const from = task.consumedDecisionSeq ?? 0;
+      return (await this.board.readDecisions(task.id)).some((d) => d.seq > from && !QUIET_DECISIONS.has(d.action));
+    } catch { return true; }
   }
 
   // Engineer: the human's decisions it hasn't read in grove_next yet, oldest first (or just the given ones if
@@ -1953,6 +1992,7 @@ export class GroveProcess {
 
   // Advance the read cursor once grove_next's answer is built, so a failure before then shows them again.
   consumeDecisions(task, decisions) {
+    // Only the session that owns the task moves its cursor; elsewhere it stays put (and nothing is persisted).
     if (!this.engine.owns(task)) return;
     const max = Math.max(task.consumedDecisionSeq ?? 0, ...decisions.map((d) => d.seq));
     const legacy = task.decisionCursorLegacyMax !== undefined;
@@ -1963,7 +2003,10 @@ export class GroveProcess {
   }
 
   // grove_next's "reviews": the full text of each finished review in the current round (or, between rounds,
-  // the round that just closed). Earlier rounds, and cancelled or failed hires, are left out.
+  // the round that just closed, which stays here on every grove_next until the next round starts). Earlier
+  // rounds, and cancelled or failed hires, are left out. Each says where its text came from: "results" is the
+  // reviewer's own full report; "forum" is the copy on the step's forum (clipped at 12000 characters), used
+  // when the report can't be read, with "error" saying why ("missing", "mismatch" or the board's error code).
   async reviewsFor(task) {
     const cur = currentStep(task);
     const step = cur?.forum?.round > 0 ? cur
@@ -1973,18 +2016,19 @@ export class GroveProcess {
     const out = [];
     for (const k of task.tickets) {
       if (k.step !== step.id || k.round !== round || k.status !== 'done') continue;
-      let text;
-      let clipped = false;
       let r = null;
-      try { r = await this.board.readResult(k.id); } catch { r = null; }
-      const post = step.forum.posts.filter((p) => p.kind === 'review' && p.role === k.specialty && p.round === round).at(-1);
-      if (r && r.ticket === k.id && r.token === k.token && r.status === 'done' && typeof r.text === 'string') text = r.text;
+      let error = null;
+      try { r = await this.board.readResult(k.id); } catch (e) { error = e?.code ?? 'storage_failed'; }
+      if (!error && !r) error = 'missing';
+      else if (!error && !(r.ticket === k.id && r.token === k.token && r.status === 'done' && typeof r.text === 'string')) error = 'mismatch';
+      const post = step.forum.posts.filter((p) => p.kind === 'review' && p.round === round && p.role === k.specialty && p.author === memberTitle(k)).at(-1);
+      const review = { ticket: k.id, step: step.id, round, reviewer: memberTitle(k), verdict: post?.verdict ?? null };
+      if (!error) out.push({ ...review, text: r.text, source: 'results', complete: true });
       else {
-        text = post?.text ?? '';
-        clipped = text.length >= 12000;
+        const text = post?.text ?? '';
+        const clipped = text.length >= 12000;
+        out.push({ ...review, text, source: 'forum', complete: !!post && !clipped, ...(clipped ? { clipped: true } : {}), error });
       }
-      out.push({ ticket: k.id, step: step.id, round, reviewer: memberTitle(k),
-        verdict: post?.verdict ?? null, text, ...(clipped ? { clipped: true } : {}) });
     }
     return out;
   }

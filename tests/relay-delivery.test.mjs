@@ -17,7 +17,7 @@ await fs.rm(tmp, { recursive: true, force: true });
 await fs.mkdir(tmp, { recursive: true });
 process.env.COPILOT_HOME = path.join(tmp, 'home');
 const { GroveProcess } = await import('../extensions/grove-agent-monitor/lib/process/integration.mjs');
-const { relayDelivery, DELIVERY_FALLBACK, decisionMessage, reportMessage } = await import('../extensions/grove-agent-monitor/lib/process/prompts.mjs');
+const { relayDelivery, DELIVERY_FALLBACK, decisionMessage, reportMessage, engineerWake } = await import('../extensions/grove-agent-monitor/lib/process/prompts.mjs');
 
 const links = new Map();
 const groupOf = (s) => s.link.split('?')[0];
@@ -228,7 +228,7 @@ for (const k of ['hire', 'notice', 'resend']) assert.equal(relayDelivery(k), 'qu
   next = await eng.call('grove_next');
   assert.deepEqual(next.data.reviews, [], 'round 2 has no reviews yet; round 1\'s are left out');
   // A late copy of a round-1 report doesn't pull the engineer off its work.
-  assert.match(await eng.proc.onRelay('report', r0.message.match(/\/(T1-[^\]]+)\]/)[1]), /earlier review round.*Carry on/);
+  assert.match(await eng.proc.onRelay('report', r0.message.match(/\/(T1-[^\]]+)\]/)[1]), /already recorded and closed.*call grove_next now; otherwise carry on/);
 }
 
 // 4. A steered report reaches a busy engineer at its next tool boundary, inside its turn, before it carries on;
@@ -292,13 +292,21 @@ for (const k of ['hire', 'notice', 'resend']) assert.equal(relayDelivery(k), 'qu
   await chief.call('grove_record_decision', { taskId: 'T1', decision: 'note', note: 'first' });
   await chief.call('grove_record_decision', { taskId: 'T1', decision: 'note', note: 'second' });
   await sync(eng);
-  // The board can't be read for a moment: grove_next fails, and the cursor doesn't move.
+  // The board can't be read for a moment: grove_next says so (it doesn't fail), and the cursor doesn't move.
   const read = eng.proc.board.readDecisions.bind(eng.proc.board);
   eng.proc.board.readDecisions = async () => { throw new Error('EIO'); };
-  await assert.rejects(eng.call('grove_next'), /EIO/);
-  eng.proc.board.readDecisions = read;
-  assert.equal(task().consumedDecisionSeq, 0, 'a failed grove_next leaves the cursor');
   let next = await eng.call('grove_next');
+  assert.equal(next.ok, true, next.data);
+  assert.equal(next.data.decisionsUnavailable, 'storage_failed');
+  assert.deepEqual(next.data.decisions, []);
+  assert.match(next.data.guidance, /^Grove couldn't read the human's decisions in full from the board just now.*call grove_next again.*grove_blocked/);
+  eng.proc.board.readDecisions = async () => { throw Object.assign(new Error('bad json'), { code: 'storage_corrupt' }); };
+  assert.equal((await eng.call('grove_next')).data.decisionsUnavailable, 'storage_corrupt', 'the board\'s code is passed on');
+  assert.equal(await eng.proc.hasUnreadDecisions(task()), true, 'an unreadable board counts as unread decisions');
+  eng.proc.board.readDecisions = read;
+  assert.equal(task().consumedDecisionSeq, 0, 'a degraded grove_next leaves the cursor');
+  next = await eng.call('grove_next');
+  assert.equal(next.data.decisionsUnavailable, undefined);
   assert.deepEqual(next.data.decisions.map((d) => d.note), ['first', 'second']);
   assert.equal(task().consumedDecisionSeq, next.data.decisions.at(-1).seq);
   assert.deepEqual((await eng.call('grove_next')).data.decisions, []);
@@ -335,5 +343,170 @@ for (const k of ['hire', 'notice', 'resend']) assert.equal(relayDelivery(k), 'qu
   assert.ok(r.length < 600);
 }
 
-await fs.rm(tmp, { recursive: true, force: true });
+const ticketOf = (r) => /\/(T1-[^\]]+)\]/.exec(r.message)[1];
+const hooked = (eng) => async (m) => (await eng.hooks.onUserPromptSubmitted({ prompt: m, sessionId: eng.id }))?.additionalContext;
+
+// 9. The report that closes a round is news even when Grove closed the round (on a poll) before its relay
+//    arrived; once grove_next has shown the round's end, a late copy is not. A unanimous approval through the
+//    relay finishes the step.
+{
+  const { eng, members, task } = await setup();
+  const rs = [];
+  for (const m of members) rs.push(await review(m, 'Looks right.\nVERDICT: approve'));
+  await sync(eng);
+  assert.equal(task().steps[0].status, 'done', 'unanimous approval closed S1 before the last relay arrived');
+  assert.equal(eng.proc.engine.staleTicket(task(), ticketOf(rs[2])), true, 'the engine counts the ticket as from a closed round');
+  const host = new RelayHost();
+  host.add(eng.link, hooked(eng), { active: true });
+  await report(host, members[2], rs[2]);
+  const ctx = await host.boundary(eng.link);
+  assert.match(ctx, /A reviewer reported back.*Call grove_next now/s, 'the round-closing report still sends the engineer to grove_next');
+  assert.doesNotMatch(ctx, /already recorded and closed/);
+  const next = await eng.call('grove_next');
+  assert.equal(next.data.reviews.length, 3);
+  assert.ok(next.data.reviews.every((r) => r.step === 'S1' && r.verdict === 'approve' && r.source === 'results'));
+  assert.equal(next.data.steps.find((s) => s.id === 'S1').status, 'done');
+  // Seen: a late copy of the same report is now old news, with a pointer in case.
+  assert.match(await eng.proc.onRelay('report', ticketOf(rs[2])), /already recorded and closed.*call grove_next now; otherwise carry on/s);
+  // A report Grove never issued is nothing new.
+  assert.match(await eng.proc.onRelay('report', 'T1-plan-tests-99'), /no reviewer report T1-plan-tests-99 for T1: nothing new/);
+}
+
+// 10. Three rounds of changes, each reported through the relay, escalate the step; the last report points
+//     the engineer at grove_next, which shows the escalation.
+{
+  const { eng, members, task } = await setup();
+  const host = new RelayHost();
+  host.add(eng.link, hooked(eng), { active: true });
+  let hires = members;
+  for (let round = 1; round <= 3; round++) {
+    let last = null;
+    for (const m of hires) {
+      const r = await review(m, `Round ${round}: still missing the migration.\nVERDICT: changes`);
+      await report(host, m, r);
+      last = await host.boundary(eng.link);
+    }
+    assert.match(last, /Call grove_next now/, `round ${round}'s closing report points at grove_next`);
+    await sync(eng);
+    if (round === 3) break;
+    const sub = await eng.call('grove_submit', { step: 'S1', output: `${PLAN}\nRevision ${round}.\n\n## Response to reviewers\nAddressed round ${round}.` });
+    assert.equal(sub.ok, true, sub.data);
+    hires = [];
+    for (const h of sub.data.hires) hires.push(await hire(eng, h));
+    assert.equal(hires.length, 3);
+  }
+  assert.equal(task().stage, 'escalated', 'three rounds without agreement escalate');
+  const next = await eng.call('grove_next');
+  assert.equal(next.data.reviews.length, 3);
+  assert.ok(next.data.reviews.every((r) => r.round === 3 && /Round 3/.test(r.text)), 'the last round\'s reviews, in full');
+}
+
+// 11. A send the host rejects for another reason isn't resent queued (only cannotSteer is); a second steer to
+//     a busy chat replaces the first in its one steering slot.
+{
+  const { eng, members } = await setup();
+  const r = await review(members[0], 'Nit.\nVERDICT: approve');
+  const broken = new RelayHost();
+  broken.add(eng.link, hooked(eng), { active: true, reject: 'providerError' });
+  const res = await broken.relay(r);
+  assert.deepEqual(res, [{ action: 'rejected', reason: 'providerError' }], 'one attempt, no queued resend');
+  assert.deepEqual(broken.trace.map((e) => e.event), ['rejected']);
+  const busy = new RelayHost();
+  busy.add(eng.link, hooked(eng), { active: true });
+  await busy.relay(r);
+  await busy.relay(r);
+  assert.deepEqual(busy.trace.map((e) => e.event), ['steered', 'steer-replaced', 'steered']);
+  assert.match(await busy.boundary(eng.link), /Call grove_next now/);
+  assert.equal(busy.chats.get(eng.link).seen.length, 1, 'the replaced steer lands once');
+  // Grove itself never relies on the relay: grove_next has the review either way.
+  await sync(eng);
+  assert.equal((await eng.call('grove_next')).data.reviews[0].text, 'Nit.\nVERDICT: approve');
+}
+
+// 12. When a reviewer's own report can't be read, grove_next falls back to the forum copy, says why, and tells
+//     the engineer not to act on it as complete.
+{
+  const { eng, members } = await setup();
+  const r = await review(members[0], 'Missing tests.\nVERDICT: changes');
+  await sync(eng);
+  const t = ticketOf(r);
+  const real = eng.proc.board.readResult.bind(eng.proc.board);
+  const cases = [
+    ['missing', async () => null],
+    ['mismatch', async (...a) => ({ ...(await real(...a)), token: 'forged' })],
+    ['storage_corrupt', async () => { throw Object.assign(new Error('bad json'), { code: 'storage_corrupt' }); }],
+  ];
+  for (const [error, stub] of cases) {
+    eng.proc.board.readResult = stub;
+    const next = await eng.call('grove_next');
+    assert.equal(next.ok, true, next.data);
+    const rev = next.data.reviews.find((x) => x.ticket === t);
+    assert.equal(rev.source, 'forum', `${error}: the forum copy`);
+    assert.equal(rev.error, error);
+    assert.equal(rev.complete, true, 'a short forum copy is the whole review; only clipped copies are incomplete');
+    assert.match(rev.text, /Missing tests/);
+    assert.deepEqual(next.data.reviewsIncomplete, [{ ticket: t, error }]);
+    assert.match(next.data.guidance, new RegExp(`^Grove couldn't read a review \\(${t}\\) in full from the board just now[\\s\\S]*grove_blocked`));
+  }
+  eng.proc.board.readResult = real;
+  const next = await eng.call('grove_next');
+  assert.equal(next.data.reviewsIncomplete, undefined);
+  assert.equal(next.data.reviews[0].source, 'results');
+}
+
+// 13. Delivery survives the engineer's session restarting, and a wake that can't be sent waits in the outbox.
+{
+  const { chief, eng, members } = await setup();
+  const r = await review(members[0], 'Restart-proof finding.\nVERDICT: changes');
+  await chief.call('grove_record_decision', { taskId: 'T1', decision: 'note', note: 'Before the restart.' });
+  await sync(eng, chief);
+  // The host restarts the engineer's session: a new process attaches to the same session.
+  const again = await startSession(eng.id, { link: eng.link, workingDirectory: eng.session.workingDirectory });
+  assert.equal(again.proc.role, 'lead');
+  assert.match(await again.proc.onRelay('report', ticketOf(r)), /Call grove_next now/);
+  const next = await again.call('grove_next');
+  assert.equal(next.data.reviews[0].text, 'Restart-proof finding.\nVERDICT: changes');
+  assert.deepEqual(next.data.decisions.map((d) => d.note), ['Before the restart.']);
+  // A wake the host refuses isn't lost: it waits in the outbox and goes on the next poll.
+  const send = again.session.send;
+  again.session.send = async () => { throw new Error('host busy'); };
+  const prompt = engineerWake(again.proc.engine.task('T1'), []);
+  assert.match(prompt, /call grove_next/i);
+  assert.equal(await again.proc.wake(prompt), false);
+  assert.deepEqual(again.proc.outbox, [prompt]);
+  again.session.send = send;
+  await again.proc.flushOutbox();
+  assert.deepEqual(again.proc.outbox, []);
+  assert.equal(again.sent.at(-1), prompt);
+}
+
+// 14. Even without Grove's prompt hook, the steered pointer makes the engineer read the full review in
+//     grove_next before its next action.
+{
+  const { eng, members } = await setup();
+  const host = new RelayHost();
+  host.add(eng.link, async () => { throw new Error('hook disabled'); }, { active: true, hookEnabled: false });
+  const text = `${'Long finding. '.repeat(1000)}\nVERDICT: changes`;
+  const r = await review(members[0], text);
+  await report(host, members[0], r);
+  await host.boundary(eng.link, 'edit');
+  assert.match(host.chats.get(eng.link).seen.at(-1), /grove_next/);
+  await sync(eng);
+  const next = await eng.call('grove_next');
+  host.log('grove-next', eng.link, { chars: next.data.reviews[0]?.text.length });
+  host.log('engineer-next-action', eng.link);
+  await host.endTurn(eng.link);
+  const at = (ev) => host.trace.findIndex((e) => e.event === ev);
+  assert.ok(at('delivered') < at('grove-next') && at('grove-next') < at('engineer-next-action') && at('engineer-next-action') < at('turn-end'), JSON.stringify(host.trace));
+  assert.equal(host.trace[at('grove-next')].chars, text.length, 'the whole review, read inside the turn');
+}
+
+// 15. Decision relays: an unknown seq is nothing new, and the wake prompt points at grove_next.
+{
+  const { eng, task } = await setup();
+  assert.match(await eng.proc.onRelay('decision', 'T1:999999'), /no decision #999999 for T1: nothing new/);
+  assert.match(engineerWake(task(), []), /grove_next/);
+}
+
+await fs.rm(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 console.log('relay delivery tests passed');
