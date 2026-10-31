@@ -350,6 +350,16 @@ you ──► Chief of Staff ──► T1 engineer ── plan · execute · ver
 - **Back down:** your answer goes to the Chief, which records it with
   `grove_record_decision` and **messages the engineer** with the result. The
   engineer's turn applies it and carries on.
+- **Decisions converge.** A decision is recorded once: a second click, or
+  the same answer again before the engineer has applied the first, is a
+  duplicate. A cancel overtakes the decisions queued before it, so a
+  queued Complete never ships a task you since dismissed. Grove only
+  messages the engineer that holds the current hand-off, at the link its
+  own chat reported or the one `create_session` returned for that hand-off;
+  after `grove_handoff` the old chat is never used. Until the engineer applies
+  a decision, the Chief relays it again with backoff. If the engineer still
+  can't be reached, the Chief is asked once to start a new one. The inbox
+  shows where each decision has got to.
 - **Every hand-off is visible.** Each one is a `send_message` from one model
   to another, so it shows up as a turn in that chat in VS Code.
   - **Why not wake sessions directly?** Turns an extension starts itself (the

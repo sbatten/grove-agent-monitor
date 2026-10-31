@@ -152,6 +152,13 @@ function started(chief, eng, prompt) {
   chief.emit({ type: 'tool.execution_complete', data: { toolCallId, success: true, result: { content: `New session created (${eng.link}).` } } });
 }
 let res;
+// An engineer asks the host which chat it is (get_current_session); Grove learns its own link from that.
+let gcs = 0;
+function whoAmI(s, openLink = s.link) {
+  const toolCallId = `gcs-${++gcs}`;
+  s.emit({ type: 'tool.execution_start', data: { toolCallId, toolName: 'get_current_session', arguments: {} } });
+  s.emit({ type: 'tool.execution_complete', data: { toolCallId, success: true, result: { content: JSON.stringify({ openLink: `${openLink}?view=chat`, workingDirectory: s.session.workingDirectory }) } } });
+}
 let h;
 let told;
 let back;
@@ -544,6 +551,9 @@ res = await chief.call('grove_handoff', { taskId: 'T3' });
 const eng3b = await startSession('eng-3b');
 await eng3b.hooks.onUserPromptSubmitted({ prompt: res.data.handoff.prompt });
 assert.equal(eng3b.proc.role, 'lead');
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T3')).link, null, 'the replaced engineer\'s chat is no longer a route');
+whoAmI(eng3b);
+assert.equal(eng3b.proc.engine.task('T3').lead.linkSource, 'self', 'the new engineer learns its own chat');
 res = await eng3b.call('grove_next');
 assert.match(res.data.guidance, /You took this task over from another engineer/);
 assert.deepEqual(res.data.results.map((x) => x.step), ['S1 · Research: Find the flaky tests']);
@@ -563,7 +573,7 @@ assert.deepEqual(await chief.proc.attachTask('T3'), { attached: ['T3'] });
 up = await chief.hooks.onUserPromptSubmitted({ prompt: 'Looks good.' });
 assert.match(up.additionalContext, /### Quill \(T3\) "File issues" \(Awaiting your sign-off\)/);
 assert.match(up.additionalContext, /Engineer's summary: Filed two issues/);
-assert.match(up.additionalContext, /Engineer session: agent-host-session:/);
+assert.match(up.additionalContext, /Engineer session: agent-host-session:\/\/ahp-session\/G-eng-3b\n/, 'the current engineer, never the one it replaced');
 assert.deepEqual(await chief.proc.inboxDecide('T3', 'complete'), { task: 'T3', decision: 'approve', outcome: 'done' });
 await sync(chief, eng3b);
 assert.equal(eng3b.proc.engine.task('T3').stage, 'done', 'the engineer applies an inbox decision from the board');
@@ -684,6 +694,143 @@ back = await send(chief, res.data.message.session, res.data.message.message);
 assert.equal(back.target, eng5, 'the same engineer');
 assert.equal(t5().stage, 'routing');
 assert.match((await eng5.call('grove_next')).data.guidance, /The human asked for more: "Run it again with this week's data\."/);
+
+// 16b. Inbox decisions converge, and messages only go to the engineer that holds the task now. A double
+//      click records one decision; a dismiss overtakes a complete the engineer never picked up; relays to a
+//      dead engineer back off, then the Chief is asked (once) for a new engineer, who applies the cancel.
+const { decisionMessage } = await import('../extensions/grove-agent-monitor/lib/process/prompts.mjs');
+let clock = Date.now();
+chief.proc.now = () => clock;
+const MIN = 60 * 1000;
+const relayTick = async (mins = 10) => {
+  clock += mins * MIN;
+  await settle(chief);
+  await chief.proc.engine.refresh();
+  await chief.proc.relayToChief();
+  await settle(chief);
+};
+const relayOf = (text) => ({ session: /\nsession: (\S+)\n/.exec(text)[1], message: /\nmessage: ([\s\S]*?)\nThen end your turn/.exec(text)[1] });
+let rtc = 0;
+const chiefSend = (args, outcome) => {
+  const toolCallId = `relay-${++rtc}`;
+  chief.emit({ type: 'tool.execution_start', data: { toolCallId, toolName: 'send_message', arguments: args } });
+  const finish = (ok) => chief.emit({ type: 'tool.execution_complete', data: ok ? { toolCallId, success: true, result: { content: '{"action":"started"}' } } : { toolCallId, success: false, error: { message: `Session not found (${args.session}?token=secret)` } } });
+  if (outcome !== undefined) finish(outcome);
+  return finish;
+};
+res = await chief.call('grove_create_task', { title: 'Ship notes', goal: 'Write the release notes.', kind: 'research', destination: { mode: 'scratch' } });
+const h6 = res.data.handoff.prompt;
+await settle(chief);
+const eng6 = await startSession('eng-6');
+started(chief, eng6, h6);
+await eng6.hooks.onUserPromptSubmitted({ prompt: h6 });
+await eng6.call('grove_plan_steps', { steps: [{ kind: 'research', title: 'Draft notes' }] });
+await eng6.call('grove_submit', { output: '## Answer\nThe notes are drafted.\n\n## How\nRead every merged PR since the last release.' });
+await eng6.call('grove_deliver', { summary: 'Release notes drafted.' });
+await sync(eng6, chief);
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T6')).route, 'verified');
+// Two quick clicks on Complete: one decision.
+const clicks = await Promise.all([chief.proc.inboxDecide('T6', 'complete'), chief.proc.inboxDecide('T6', 'complete')]);
+assert.deepEqual(clicks.map((c) => !!c.duplicate).sort(), [false, true], 'the second click is a duplicate');
+assert.equal((await chief.proc.board.readDecisions('T6')).length, 1, 'one decision on the board');
+assert.equal(chief.proc.inboxLog.filter((x) => x.taskId === 'T6').length, 1, 'logged once');
+// After a restart the inbox log is gone; the board still knows it.
+assert.equal((await chief.proc.inboxDecide('T6', 'complete')).duplicate, true, 'an identical click later is still a duplicate');
+assert.deepEqual(chief.proc.liveView().process.inbox.items.find((x) => x.taskId === 'T6')?.decision ?? chief.proc.decisionView('T6'), { seq: 1, action: 'approve', state: 'recorded' });
+// The engineer's chat has gone away: it never applies that. The human dismisses the task instead.
+eng6.proc.dispose();
+assert.equal((await chief.proc.inboxDecide('T6', 'dismiss')).decision, 'cancel');
+assert.equal(chief.proc.decisionView('T6').state, 'recorded');
+// The first relay: Grove couldn't post to the Chief's own chat. Nothing counts as tried.
+const realSend = chief.session.send;
+chief.session.send = async () => { throw new Error('chat busy'); };
+await relayTick();
+chief.session.send = realSend;
+let r6 = chief.proc.board.meta.decisionRelays.T6;
+assert.deepEqual([r6.attempts, r6.wakeFailures, r6.lastError], [0, 1, 'could not post to the Chief\'s chat']);
+// Relay 1: the Chief's send fails (the link is redacted in the reason). Relay 2: it is accepted, but the
+// engineer never applies it. Relay 3 is still in flight when the Chief is told the engineer is unreachable.
+await relayTick();
+let rel = relayOf(chief.sent.at(-1));
+assert.equal(rel.session, eng6.link, 'relayed to the engineer that holds the task');
+assert.match(rel.message, /^\[grove-decision:chief-1\/T6:2\]/);
+chiefSend(rel, false);
+await settle(chief);
+assert.equal(chief.proc.decisionView('T6').state, 'delivery-failed');
+assert.match(chief.proc.decisionView('T6').reason, /Session not found/);
+assert.doesNotMatch(chief.proc.decisionView('T6').reason, /secret/, 'no link query (or token) in the reason');
+await relayTick();
+chiefSend(relayOf(chief.sent.at(-1)), true);
+await settle(chief);
+assert.equal(chief.proc.decisionView('T6').state, 'delivery-accepted');
+await relayTick();
+const late = chiefSend(relayOf(chief.sent.at(-1)));
+assert.equal(chief.proc.decisionView('T6').attempts, 3);
+await relayTick();
+assert.equal(chief.proc.decisionView('T6').state, 'needs-new-engineer');
+assert.match(chief.sent.at(-1), /the human's decision \(#2, "cancel"\) hasn't reached its engineer: 3 relays haven't reached it.*Call grove_handoff for T6/s);
+await relayTick();
+await relayTick();
+assert.equal(chief.sent.filter((m) => /grove_handoff for T6/.test(m)).length, 1, 'asked once per engineer');
+// Two hand-offs; the create_session result for the first comes back late and is ignored.
+const pA = (await chief.call('grove_handoff', { taskId: 'T6' })).data.handoff.prompt;
+assert.equal(chief.proc.decisionView('T6').state, 'awaiting-engineer');
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T6')).link, null, 'the old chat is no longer a route');
+const pB = (await chief.call('grove_handoff', { taskId: 'T6' })).data.handoff.prompt;
+started(chief, { link: 'agent-host-session://ahp-session/G-ghost' }, pA);
+await settle(chief);
+assert.equal(chief.proc.board.meta.leadRoutes?.T6, undefined, 'a superseded hand-off never becomes a route');
+late(true);
+await settle(chief);
+assert.equal(chief.proc.decisionView('T6').state, 'awaiting-engineer', 'a delivery to the replaced engineer doesn\'t count');
+res = await chief.call('grove_status', { taskId: 'T6' });
+assert.deepEqual([res.data.tasks[0].engineer.route, res.data.tasks[0].engineer.handoffPending], ['none', true]);
+// The new engineer: create_session's result arrives first, then it claims.
+const eng6b = await startSession('eng-6b');
+started(chief, eng6b, pB);
+await settle(chief);
+await eng6b.hooks.onUserPromptSubmitted({ prompt: pB });
+await sync(eng6b, chief);
+const t6 = eng6b.proc.engine.task('T6');
+assert.equal(t6.stage, 'cancelled', 'the dismiss wins; the complete never runs');
+assert.deepEqual(t6.decisionResults.map((x) => [x.seq, x.action, x.result]), [[1, 'approve', 'superseded'], [2, 'cancel', 'applied']]);
+await relayTick();
+assert.deepEqual(chief.proc.decisionView('T6'), { seq: 2, action: 'cancel', state: 'applied' });
+assert.ok(!chief.proc.liveView().process.inbox.items.some((x) => x.taskId === 'T6'));
+// A stale relay of the overtaken complete reaches the new engineer: nothing to do.
+const d1 = (await chief.proc.board.readDecisions('T6')).find((x) => x.seq === 1);
+back = await send(chief, eng6b.link, decisionMessage(chief.proc.board.id, chief.proc.engine.task('T6'), d1));
+assert.match(back.context, /Decision #1 was already handled \(result: superseded: overtaken by cancel #2\); nothing to do/);
+assert.equal(eng6b.proc.engine.task('T6').stage, 'cancelled');
+
+// 16c. Another task is untouched by all that. Its engineer claims before the Chief sees create_session's
+//      result, and a link an older Grove stored without a source is never used.
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T5')).link, eng5.link, 'T5 still routes to its engineer');
+res = await chief.call('grove_create_task', { title: 'Count stars', goal: 'How many stars this month?', kind: 'research', destination: { mode: 'scratch' } });
+const h7 = res.data.handoff.prompt;
+await settle(chief);
+const eng7 = await startSession('eng-7');
+await eng7.hooks.onUserPromptSubmitted({ prompt: h7 });
+await sync(eng7, chief);
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T7')).link, null, 'no route until one is confirmed');
+started(chief, eng7, h7);
+await settle(chief);
+assert.equal(chief.proc.leadRoute(chief.proc.engine.task('T7')).link, eng7.link);
+const t7 = eng7.proc.engine.task('T7');
+t7.lead.link = 'agent-host-session://ahp-session/G-ghost';
+delete t7.lead.linkSource;
+eng7.proc.engine.changed(t7, null);
+await settle(eng7);
+await chief.proc.engine.refresh();
+let r7 = chief.proc.leadRoute(chief.proc.engine.task('T7'));
+assert.deepEqual([r7.link, r7.quarantined], [eng7.link, true], 'the unsourced link is ignored');
+await sync(eng7);
+assert.deepEqual([t7.lead.link, t7.lead.linkSource], [eng7.link, 'chief'], 'the engineer drops it and takes the verified route');
+// Hand-off tokens never leave the board.
+const tokens = [...Object.values(chief.proc.board.meta.handoffs ?? {}), ...Object.values(chief.proc.board.meta.leadRoutes ?? {}).map((x) => x.token)].filter(Boolean);
+assert.ok(tokens.length);
+const shown = JSON.stringify([(await chief.call('grove_status')).data, chief.proc.liveView()]);
+for (const tok of tokens) assert.ok(!shown.includes(tok), 'no hand-off token in status or views');
 
 // 17. A board from the earlier process (a task lead with persona sessions) isn't migrated: Grove leaves it
 //     untouched and says to start a new Chief of Staff chat.

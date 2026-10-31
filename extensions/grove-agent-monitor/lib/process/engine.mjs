@@ -37,6 +37,8 @@ export const RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000;
 export const MAX_ATTEMPTS = 3;
 export const MAX_BLOCKS = 2;
 export const MAX_STEPS = 24;
+// How many decision outcomes a task keeps, so the Chief and the inbox can say what became of each one.
+export const DECISION_RESULTS = 30;
 // A dispatched hire whose session never picks it up, or a running one whose session stops reporting, fails.
 export const CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
 export const HEARTBEAT_TIMEOUT_MS = 4 * 60 * 1000;
@@ -549,12 +551,20 @@ export class ProcessEngine {
     return t;
   }
 
-  // Apply the human's decisions (recorded by the Chief) that this owner has not applied yet.
+  // Apply the human's decisions (recorded by the Chief) that this owner has not applied yet. A cancel in the
+  // batch wins: the earlier decisions it overtook (other than notes and questions) are superseded, so a
+  // queued approve never ships a task the human has since dismissed. Each outcome is kept on the task.
   applyDecisions(task, items) {
     const applied = [];
-    for (const d of items) {
-      if (d.seq <= (task.decisionsApplied ?? 0)) continue;
+    const pending = items.filter((d) => d.seq > (task.decisionsApplied ?? 0)).sort((a, b) => a.seq - b.seq);
+    const cancelAt = pending.find((d) => d.action === 'cancel')?.seq;
+    for (const d of pending) {
       task.decisionsApplied = d.seq;
+      if (cancelAt !== undefined && d.seq < cancelAt && !['note', 'question'].includes(d.action)) {
+        this.noteDecision(task, d, 'superseded', `overtaken by cancel #${cancelAt}`, cancelAt);
+        this.changed(task, `Decision #${d.seq} "${d.action}" skipped: the human cancelled the task after it.`);
+        continue;
+      }
       try {
         this.humanDecision({ taskId: task.id, action: d.action, note: d.note ?? '', ship: typeof d.ship === 'boolean' ? d.ship : undefined });
         if (d.workspaceRepair && d.seq > (task.repairInvalidatedThrough ?? 0)
@@ -562,13 +572,25 @@ export class ProcessEngine {
           task.workspaceRepair = { ...d.workspaceRepair, seq: d.seq };
           this.changed(task, 'The human authorized workspace repair; immediate host confirmation is still required.');
         }
+        this.noteDecision(task, d, 'applied');
         applied.push(d);
       } catch (err) {
         if (!(err instanceof ProcessError)) throw err;
+        this.noteDecision(task, d, 'rejected', err.message);
         this.changed(task, `Decision "${d.action}" not applied: ${err.message}`);
       }
     }
     return applied;
+  }
+
+  noteDecision(task, d, result, reason, by) {
+    task.decisionResults = [...(task.decisionResults ?? []), {
+      seq: d.seq, action: d.action, result, at: now(), ...(reason ? { reason: clip(reason, 200) } : {}), ...(by ? { by } : {}),
+    }].slice(-DECISION_RESULTS);
+  }
+
+  decisionResult(task, seq) {
+    return (task.decisionResults ?? []).find((r) => r.seq === seq) ?? null;
   }
 
   cancelTask(id, reason = '') {
@@ -870,7 +892,10 @@ export class ProcessEngine {
   // Reviewers are nested chats in the engineer's session, so a reviewer's link names the engineer's own chat.
   learnLeadLink(task, memberLink) {
     const base = String(memberLink).split('?')[0];
-    if (task.lead && !task.lead.link && /^agent-host-session:\/\//.test(base)) task.lead.link = base;
+    if (task.lead && !task.lead.link && /^agent-host-session:\/\//.test(base)) {
+      task.lead.link = base;
+      task.lead.linkSource = 'member';
+    }
   }
 
   // Check a reviewer's final message against its contract. Returns { ok, reason?, blocked? }.
