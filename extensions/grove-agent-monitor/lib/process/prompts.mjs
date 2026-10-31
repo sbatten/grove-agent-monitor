@@ -273,10 +273,33 @@ const firstLine = (t, n = 160) => {
   return line.length > n ? `${line.slice(0, n - 1)}…` : line;
 };
 
+// How each relay is sent. Relays that change what the receiving chat should be doing right now steer its
+// active turn (they arrive at its next tool boundary); anything else queues as a new turn. A steer to an idle
+// chat is rejected with reason "cannotSteer", and only that result is resent as a queued message.
+const STEER_DECISIONS = new Set(['changes', 'note', 'question', 'hold', 'cancel']);
+export function relayDelivery(kind, action) {
+  if (kind === 'report') return 'steer';
+  if (kind === 'decision') return STEER_DECISIONS.has(action) ? 'steer' : 'queue';
+  return 'queue';
+}
+export const DELIVERY_FALLBACK = 'If send_message returns "rejected" with reason "cannotSteer" (the chat is idle), send the same message again with delivery "queue". Don\'t resend on any other result.';
+
+// Text quoted inside a relay can't carry a Grove marker of its own.
+export function defang(s) {
+  return String(s ?? '').replace(/\[grove-/gi, '[grove\u2011');
+}
+
+// Relays are pointers: the full text is always on the board, and grove_next returns it.
+const GO_NEXT = 'Before doing anything else, call grove_next';
+export function notePreview(note, n = 300) {
+  const t = defang(String(note ?? '').trim());
+  return t.length > n ? `${t.slice(0, n)}…(clipped; full text in grove_next)` : t;
+}
+
 // Reviewer → engineer: its review is in.
 export function reportMessage(boardId, task, ticket, { status, text }) {
   const what = status === 'done' ? `finished ${ticket.id}` : `could not finish ${ticket.id}`;
-  return `[grove-report:${boardId}/${ticket.id}] ${memberTitle(ticket)} ${what} for ${taskLabel(task)}: ${firstLine(text) || '(see my chat)'}`;
+  return `[grove-report:${boardId}/${ticket.id}] ${memberTitle(ticket)} ${what} for ${taskLabel(task)}: ${defang(firstLine(text)) || '(see my chat)'} ${GO_NEXT}: its "reviews" field has the full review.`;
 }
 
 // Engineer → Chief: the task needs the human.
@@ -291,12 +314,13 @@ export function noticeMessage(boardId, task, key) {
 const DECISION_WORDS = {
   approve: 'approved', changes: 'requested changes', note: 'sent a note', question: 'asked a question', hold: 'put the task on hold',
   resume: 'resumed the task', retry: 'unblocked the task', merge: 'asked to merge the pull request', cancel: 'cancelled the task',
+  shelve: 'shelved the task', unshelve: 'took the task off the shelf',
 };
 
 // Chief → engineer: the human decided.
 export function decisionMessage(boardId, task, item) {
   const words = DECISION_WORDS[item.action] ?? item.action;
-  return `[grove-decision:${boardId}/${task.id}:${item.seq}] The human ${words} for ${taskLabel(task)}.${item.note ? ` They said: "${String(item.note).slice(0, 300)}"` : ''}`;
+  return `[grove-decision:${boardId}/${task.id}:${item.seq}] The human ${words} for ${taskLabel(task)}.${item.note ? ` They said: "${notePreview(item.note)}"` : ''} ${GO_NEXT}: its "decisions" field has the full decision.`;
 }
 
 export const MEMBER_MARKER = /\[grove-hire:([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/(T\d{1,6}-[a-z0-9-]{1,40})\/([a-f0-9]{8,64})\]/;
@@ -311,14 +335,17 @@ export function memberRevive(ticket, why) {
 }
 
 
-export function engineerWake(task, decision) {
-  const said = decision.note ? ` They said: "${clip(decision.note, 1500)}"` : '';
-  const from = decision.via === 'grove' ? 'in the Grove inbox' : 'relayed by the Chief of Staff';
-  const next = decision.action === 'note' ? ' Take it into account: change the steps with grove_plan_steps if it changes the plan, then call grove_next.'
-    : decision.action === 'question' ? ' Call grove_next: answer their question with grove_answer (find out what you need first).'
-      : decision.action === 'hold' ? ' Everyone has stopped. Do nothing more; end your turn.'
-        : ' Call grove_next and continue.';
-  return `[Grove] The human ${DECISION_WORDS[decision.action] ?? decision.action} for ${taskLabel(task)} (${from}).${said}\nThe task is now "${stageLabel(task)}".${next}`;
+// Grove wakes the engineer itself (a decision made in the Grove inbox, or one missed while it was down). It lists
+// every decision the engineer hasn't read yet; grove_next has their full text.
+export function engineerWake(task, decisions) {
+  const list = (Array.isArray(decisions) ? decisions : [decisions]).filter(Boolean);
+  const lines = list.map((d) => `- #${d.seq} ${DECISION_WORDS[d.action] ?? d.action} (${d.via === 'grove' ? 'in the Grove inbox' : 'relayed by the Chief of Staff'})${d.note ? `: "${notePreview(d.note)}"` : ''}`);
+  const last = list.at(-1);
+  const next = last?.action === 'hold' ? ' Read them, then do nothing more: everyone has stopped; end your turn.'
+    : last?.action === 'question' ? ' Then answer their question with grove_answer (find out what you need first).'
+      : last?.action === 'note' ? ' Take them into account: change the steps with grove_plan_steps if they change the plan.'
+        : ' Then continue.';
+  return `[Grove] The human made ${list.length === 1 ? 'a decision' : `${list.length} decisions`} for ${taskLabel(task)}:\n${lines.join('\n')}\nThe task is now "${stageLabel(task)}". ${GO_NEXT}: its "decisions" field has the full text.${next}`;
 }
 
 // Posted into the Chief of Staff's session when a task needs the human.
@@ -394,7 +421,7 @@ export function hireInstruction(task, ticket, { boardId, route }) {
   const role = `${ticket.specialty} reviewer of ${ticket.step}`;
   const text = `${hireMarker(boardId, ticket)} Grove assignment ${ticket.id} for ${taskLabel(task)} (${role}). Grove fills in your full brief.`;
   const base = { ticket: ticket.id, task: task.id, role, attempt: ticket.attempt };
-  if (route.tool === 'send_message') return { ...base, tool: 'send_message', session: route.session, message: text };
+  if (route.tool === 'send_message') return { ...base, tool: 'send_message', session: route.session, message: text, delivery: relayDelivery('hire') };
   const model = memberModel(task, ticket);
   return { ...base, tool: 'create_session', title: `${taskTag(task)} · ${memberTitle(ticket)}`, prompt: text,
     relationship: 'currentSession', ...reviewerPlacement(task, ticket), ...(model ? { model } : {}) };

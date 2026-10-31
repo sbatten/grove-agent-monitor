@@ -340,16 +340,23 @@ you ──► Chief of Staff ──► T1 engineer ── plan · execute · ver
   `grove-review` skill, the task, the output under review, the results of
   earlier steps and the review discussion. When the reviewer's turn ends,
   Grove checks its verdict, writes it to the board, and has the reviewer
-  **report to the engineer with `send_message`**, which starts the engineer's
-  next turn. The engineer's Grove applies it (the engineer's session is the
+  **report to the engineer with `send_message`**. The report steers the
+  engineer's active turn (`delivery: "steer"`), or, if the engineer is idle
+  (`rejected`/`cannotSteer`), is resent queued and starts its next turn. The engineer's Grove applies it (the engineer's session is the
   only writer of task state).
 - **Up:** when a task needs you (a delivered result, an escalation, a
   blocker), the engineer **messages the Chief** (`grove_next` lists the
   message). Grove attaches the full details to that turn, and the Chief relays
   them to you.
 - **Back down:** your answer goes to the Chief, which records it with
-  `grove_record_decision` and **messages the engineer** with the result. The
-  engineer's turn applies it and carries on.
+  `grove_record_decision` and **messages the engineer** with the result.
+  Decisions that change the engineer's work (changes, note, question, hold,
+  cancel) steer its active turn; the rest queue. The engineer's turn applies
+  it and carries on.
+- **Relays are pointers.** Host messages can be clipped or arrive out of
+  order, so a relay only carries its marker and tells the engineer to call
+  `grove_next`, whose `decisions` and `reviews` fields hold the full text.
+  Stale, replayed or forged markers are ignored.
 - **Every hand-off is visible.** Each one is a `send_message` from one model
   to another, so it shows up as a turn in that chat in VS Code.
   - **Why not wake sessions directly?** Turns an extension starts itself (the
@@ -645,7 +652,7 @@ skills/grove-sprites/
 | `grove_cancel_task` | Chief | Cancel a task. |
 | `grove_status` | anyone | Show each task's stage, kind, engineer and reviewers (with chat links), steps and their review votes, recent history, and what's waiting on the human. |
 | `grove_plan_steps` | engineer | Choose or change the route: `{ template?, steps?: [{ kind, title?, brief?, reviewers? }], replace?, redoFrom?, note? }`. Returns what to do next, like `grove_next`. |
-| `grove_next` | engineer | What to do now: the assignment for the step in progress (`work`: skill, brief, review feedback, evidence folder), reviewer hires to make (`create_session` with `title`, `prompt`, `relationship: "currentSession"`, `model` for a new reviewer, or `send_message` with `session`, `message` for one who has a chat), messages to send the Chief, and, when no step is running, the results and what to decide. |
+| `grove_next` | engineer | What to do now: the assignment for the step in progress (`work`: skill, brief, review feedback, evidence folder), reviewer hires to make (`create_session` with `title`, `prompt`, `relationship: "currentSession"`, `model` for a new reviewer, or `send_message` with `session`, `message` for one who has a chat), messages to send the Chief, `decisions` (the human's decisions not yet read, with notes) and `reviews` (the current round's verdicts), and, when no step is running, the results and what to decide. |
 | `grove_submit` | engineer | Submit the step in progress: `{ step, output }`. Grove checks it against the step's contract and records it; if the step has reviewers, it returns their hires. |
 | `grove_deliver` | engineer | Hand the result to the human: `{ summary, ask?, decisions?, ship? }`, where `ask` is the one thing the engineer needs from the human (shown at the top of the report and in the inbox), `decisions` are the key decisions made, each with its reason, and `ship: false` means there's no PR. For a code change, Grove first adds a step for the engineer to open a draft PR, then brings it for sign-off. Grove writes the task report. Returns the report's path and the message to send the Chief. While a PR is under watch, it hands back to watching instead. |
 | `grove_update` | engineer | Post progress on the task's status board: `{ text }`. |
