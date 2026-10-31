@@ -35,8 +35,8 @@ import {
 } from './engine.mjs';
 import { execFile } from 'node:child_process';
 import {
-  briefFor, hireInstruction, engineerHandoff, engineerBrief, engineerContext, engineerWake, stepAssignment, chiefNotice, chiefAnswer,
-  memberContext, memberRevive, LEAD_MARKER, MEMBER_MARKER, RELAY_MARKER, reportMessage, noticeMessage, decisionMessage,
+  briefFor, hireInstruction, engineerHandoff, engineerBrief, engineerContext, engineerWake, relayDelivery, DELIVERY_FALLBACK, stepAssignment, chiefNotice, chiefAnswer,
+  memberContext, memberRevive, LEAD_MARKER, MEMBER_MARKER, RELAY_MARKER, reportMessage, noticeMessage, decisionMessage, defang,
 } from './prompts.mjs';
 import { validateEvidence } from './evidence.mjs';
 import { memberModel, engineerModel } from './models.mjs';
@@ -294,6 +294,9 @@ export class GroveProcess {
     this.warned = new Set();
     this.outbox = [];
     this.wokenFor = new Map(); // engineer: pending item id → times this session was woken for it
+    // Engineer: reports Grove recorded from the board before the engineer saw them (in grove_next or their relay).
+    // The poll can close a round before the round-closing report's relay lands; that relay is still news.
+    this.unseenReports = new Set();
     this.inboxLog = []; // chief: what the human decided in the Grove inbox since the Chief's last turn
     this.inboxPending = new Map(); // chief: task id → inbox decision its engineer hasn't applied yet
     this.attached = new Map(); // chief: task id → when the human attached it to their next message
@@ -572,7 +575,7 @@ export class GroveProcess {
     if (found && outcome) {
       const link = await this.leadLinkFor(found.task.id);
       if (!link) return undefined;
-      w.reportDue = { link, message: reportMessage(this.board.id, found.task, found.ticket, outcome), tries: 0, sent: false };
+      w.reportDue = { link, message: reportMessage(this.board.id, found.task, found.ticket, outcome), delivery: relayDelivery('report'), tries: 0, sent: false };
     }
     const due = w?.reportDue;
     if (!due || due.sent || due.tries >= 2) {
@@ -582,7 +585,7 @@ export class GroveProcess {
     due.tries += 1;
     return {
       decision: 'block',
-      reason: `Grove: your work is recorded. Now report back to the task's engineer: call send_message with session "${due.link}" and message exactly:\n${due.message}\nThen end your turn with one short line.`,
+      reason: `Grove: your work is recorded. Now report back to the task's engineer: call send_message with delivery "${due.delivery ?? 'steer'}", session "${due.link}" and message exactly:\n${due.message}\nThen end your turn with one short line. ${DELIVERY_FALLBACK}`,
     };
   }
 
@@ -681,7 +684,10 @@ export class GroveProcess {
     if (!open.size) return n;
     for (const r of await this.board.readResults()) {
       if (!open.has(r.ticket)) continue;
-      if (await this.engine.applyResult(r)) n += 1;
+      if (await this.engine.applyResult(r)) {
+        n += 1;
+        this.unseenReports.add(r.ticket);
+      }
     }
     return n;
   }
@@ -734,7 +740,7 @@ export class GroveProcess {
       if (!t || (t.decisionsApplied ?? 0) >= p.seq || TERMINAL.has(t.stage)) { this.inboxPending.delete(taskId); continue; }
       if (now - p.at < this.graceMs || p.relayed) continue;
       p.relayed = true;
-      if (p.message) sends.push({ id: null, text: `[Grove] The human ${INBOX_WORDS[p.action]} ${taskLabel(t)} "${t.title}"${p.via === 'chat' ? '' : ' in the Grove inbox'}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${p.message.session}\nmessage: ${p.message.message}\nThen end your turn without further comment.` });
+      if (p.message) sends.push({ id: null, text: `[Grove] The human ${INBOX_WORDS[p.action]} ${taskLabel(t)} "${t.title}"${p.via === 'chat' ? '' : ' in the Grove inbox'}, but its engineer hasn't picked that up. Send the engineer this message with send_message, exactly as given:\nsession: ${p.message.session}\ndelivery: queue\nmessage: ${p.message.message}\nThen end your turn without further comment.` });
     }
     if (!sends.length) return;
     // Send before recording: after a crash a notice may repeat, but it is never lost.
@@ -754,12 +760,12 @@ export class GroveProcess {
     // Decisions made in the Grove inbox come with no message from the Chief, so the engineer wakes itself.
     const fromGrove = applied.filter((d) => d.via === 'grove' && !QUIET_DECISIONS.has(d.action)).at(-1);
     if (fromGrove && !wake && !TERMINAL.has(task.stage)) {
-      await this.wake(engineerWake(task, fromGrove));
+      await this.wake(engineerWake(task, await this.unreadDecisions(task, applied)));
       return applied;
     }
     if (wake && (await this.leadPending(task)).length) {
       for (const p of await this.leadPending(task)) this.noteWake(p.id);
-      await this.wake(engineerWake(task, applied.at(-1)));
+      await this.wake(engineerWake(task, await this.unreadDecisions(task, applied)));
     }
     return applied;
   }
@@ -1215,16 +1221,37 @@ export class GroveProcess {
   // A hand-off message from another session arrived in this chat.
   async onRelay(kind, ref) {
     if (kind === 'report' && this.role === 'lead') {
+      const before = this.leadTask();
+      if (!before) return null;
+      if (!before.tickets.some((k) => k.id === ref)) {
+        await this.collectResults();
+        const task = this.leadTask();
+        return task && this.nothingNew(task, `Grove has no reviewer report ${ref} for ${task.id}`);
+      }
+      // A steered report can land in the middle of later work: one from a round that's over, whose result
+      // Grove already recorded, must not pull the engineer off what it's doing now.
+      // One Grove recorded from the board but the engineer hasn't seen yet (it may have closed the round) is not.
+      const stale = this.engine.staleTicket(before, ref) && !this.unseenReports.has(ref);
       const n = await this.collectResults();
+      this.unseenReports.delete(ref);
       const task = this.leadTask();
       if (!task) return null;
-      return `${engineerContext(task, { initial: false })} A reviewer reported back${n ? '; Grove recorded it' : ''}. Call grove_next now and do what it says.`;
+      if (stale && !n && !(await this.hasUnreadDecisions(task))) {
+        return `${engineerContext(task, { initial: false })} This reviewer report is from a review round Grove already recorded and closed. If you haven't seen how that round ended in grove_next, call grove_next now; otherwise carry on with what you were doing.`;
+      }
+      return `${engineerContext(task, { initial: false })} A reviewer reported back${n ? '; Grove recorded it' : ''}. Call grove_next now: its "reviews" field has the full review. Then do what it says.`;
     }
     if (kind === 'decision' && this.role === 'lead') {
+      const task0 = this.leadTask();
+      const m = task0 && new RegExp(`^${task0.id}:(\\d+)$`).exec(ref);
+      if (!m) return null;
       await this.applyLeadDecisions();
       const task = this.leadTask();
       if (!task) return null;
-      return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now and do what it says.`;
+      let known = true;
+      try { known = (await this.board.readDecisions(task.id)).some((d) => d.seq === Number(m[1])); } catch { /* unsure: point at grove_next */ }
+      if (!known) return this.nothingNew(task, `Grove has no decision #${m[1]} for ${task.id}`);
+      return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now: its "decisions" field has the full decision. Then do what it says.`;
     }
     if (kind === 'notice' && this.role === 'chief') {
       const [taskId, key] = ref.split(':');
@@ -1244,6 +1271,15 @@ export class GroveProcess {
       return chiefNotice(await this.withReport(item));
     }
     return null;
+  }
+
+  // Engineer: the reply to a relay for something Grove doesn't have. The host keeps one steering slot, so this
+  // pointer may have replaced a real one (a hold, a closing report): if anything is still unread, say so.
+  async nothingNew(task, what) {
+    const pending = this.unseenReports.size > 0 || (await this.hasUnreadDecisions(task));
+    return pending
+      ? `${engineerContext(task, { initial: false })} ${what}, but other news is waiting for you. Call grove_next now and do what it says before anything else.`
+      : `${engineerContext(task, { initial: false })} ${what}: nothing new. Carry on with what you were doing.`;
   }
 
   // Engineer: it sent one of its relay messages.
@@ -1834,11 +1870,13 @@ export class GroveProcess {
           : outcome === 'shipping' ? `Tell the human ${id}'s engineer will publish the pull request, and Grove will watch it through checks and review and come back when it's ready to merge or needs them`
             : outcome === 'on the shelf' ? `Tell the human ${id} is on the shelf: it's out of their inbox, its engineer is resting with everything intact, and they can bring it back from the shelf in the Grove (or by asking you) whenever they're ready${t.ship?.pr ? '; Grove keeps watching its PR and brings it back if the PR needs work' : ''}`
             : `Tell the human ${id} is ${outcome}`;
+    const delivery = relayDelivery('decision', decision);
     return {
       recorded: { task: id, decision, seq: item.seq },
       message,
+      ...(message ? { delivery, fallback: DELIVERY_FALLBACK } : {}),
       guidance: message
-        ? `Recorded. Now send ${id}'s engineer the message below with send_message, exactly as given, so it picks the decision up. Then ${tell[0].toLowerCase()}${tell.slice(1)} and end your turn.`
+        ? `Recorded. Now send ${id}'s engineer the message below with send_message and delivery "${delivery}", exactly as given, so it picks the decision up. ${delivery === 'steer' ? `${DELIVERY_FALLBACK} ` : ''}Then ${tell[0].toLowerCase()}${tell.slice(1)} and end your turn.`
         : `Recorded. ${tell} and end your turn.`,
     };
   }
@@ -1847,6 +1885,15 @@ export class GroveProcess {
     const task = this.leadTask();
     if (!task) throw new ProcessError('invalid_state', 'This chat is not working on a Grove task.');
     await this.collectResults();
+    // Apply decisions here too, in case their relay hasn't arrived (or never does): the engineer is reading now.
+    // (Not through applyLeadDecisions: that wakes the engineer, which is already here reading.)
+    let decisionsError = null;
+    let board;
+    try { board = this.engine.owns(task) ? await this.board.readDecisions(task.id) : null; } catch (e) { decisionsError = e?.code ?? 'storage_failed'; }
+    if (board && this.engine.applyDecisions(task, board).length) {
+      this.stopBlocks = 0;
+      await this.writeTaskReport(task);
+    }
     const issued = this.engine.issuedTickets([task], LEAD);
     for (const { ticket } of issued) if (!this.wokenFor.has(ticket.id)) this.noteWake(ticket.id);
     const messages = await this.leadMessages(task);
@@ -1866,8 +1913,8 @@ export class GroveProcess {
     const waitingHires = task.tickets.filter((k) => k.status === 'issued' && k.retryAt > Date.now());
     if (TERMINAL.has(task.stage)) guidance = `${task.id} is ${stageLabel(task)}. Nothing more to do here.`;
     else if (task.stage === 'shelved') guidance = `${task.id} is on the shelf: the human set it aside for later. Do nothing more: end your turn. When they pick it up again, the Chief of Staff messages this chat (or Grove wakes it).`;
-    else if (task.stage === 'on-hold') guidance = `${task.id} is on hold: the human stopped the work${task.pause?.note ? ` ("${task.pause.note}")` : ''}. Do nothing more: end your turn. The Chief of Staff messages this chat when the human resumes it.`;
-    else if (task.stage === 'blocked' && !messages.length) guidance = `${task.id} is blocked until the human does this: ${task.pause?.need}. The Chief of Staff has been told. Do nothing more: end your turn. Work picks up here when they've done it.`;
+    else if (task.stage === 'on-hold') guidance = `${task.id} is on hold: the human stopped the work${task.pause?.note ? ` ("${defang(task.pause.note)}")` : ''}. Do nothing more: end your turn. The Chief of Staff messages this chat when the human resumes it.`;
+    else if (task.stage === 'blocked' && !messages.length) guidance = `${task.id} is blocked until the human does this: ${defang(task.pause?.need)}. The Chief of Staff has been told. Do nothing more: end your turn. Work picks up here when they've done it.`;
     else if (hires.length || messages.length) guidance = 'Do everything below now, in one turn: make each reviewer hire with the given tool (create_session or send_message), and send each message with send_message, all with exactly the given fields. Then end your turn; reviewers report back to this chat.';
     else if (working) {
       work = stepAssignment(task, working, { evidenceDir: this.engine.stepEvidenceDir(task, working) });
@@ -1881,14 +1928,28 @@ export class GroveProcess {
       results = this.resultsFor(task);
       guidance = this.routingGuidance(task);
     }
-    else if (question) guidance = `The human asked: "${question.text}". Answer it with grove_answer (find out what you need first), then send the message it returns to the Chief of Staff.${inFlight.length ? ' Your reviewers are still working; they report back to this chat.' : ''}`;
+    else if (question) guidance = `The human asked: "${defang(question.text)}". Answer it with grove_answer (find out what you need first), then send the message it returns to the Chief of Staff.${inFlight.length ? ' Your reviewers are still working; they report back to this chat.' : ''}`;
     else if (inFlight.length) guidance = `${step ? `${step.id} is` : 'The work is'} with its reviewers in their own chats. End your turn; they report back to this chat.`;
     else if (SHIPPING_STAGES.has(task.stage)) guidance = `${task.id} is shipping: Grove is watching ${prLine(task.ship.pr)} and wakes you if checks fail, a reviewer asks for changes, or the human needs to decide. End your turn.`;
     else if (WAITING.has(task.stage)) guidance = `${task.id} is waiting on the human (${stageLabel(task)}), and the Chief of Staff has been told. Write a two-line summary and end your turn; the Chief messages this chat when the human decides.`;
     else if (waitingHires.length) guidance = `Hires ${waitingHires.map((k) => k.id).join(', ')} wait until the host's message limit resets (about ${new Date(Math.max(...waitingHires.map((k) => k.retryAt))).toISOString().slice(11, 16)} UTC). End your turn; Grove offers them again then.`;
     else guidance = 'Nothing to do right now.';
-    if (question && !guidance.startsWith('The human asked')) guidance += ` The human also asked: "${question.text}". Answer it with grove_answer once you can.`;
-    return { task: task.id, stage: stageLabel(task), guidance, ...(work ? { work } : {}),
+    if (question && !guidance.startsWith('The human asked')) guidance += ` The human also asked: "${defang(question.text)}". Answer it with grove_answer once you can.`;
+    // The full text of what the human decided and what reviewers said: relays only point here, so nothing
+    // depends on a relay arriving whole, in order or at all.
+    const live = !TERMINAL.has(task.stage);
+    let decisions = [];
+    if (live && !decisionsError) {
+      try { decisions = await this.decisionsFor(task); } catch (e) { decisionsError = e?.code ?? 'storage_failed'; }
+    }
+    const reviews = live ? await this.reviewsFor(task) : [];
+    const unreadable = reviews.filter((r) => r.error);
+    if (decisions.length) guidance = `Read "decisions" first: the human decided something since you last looked${decisions.some((d) => d.historical) ? ' (entries marked historical are from before this list existed: check whether you already acted on them before acting)' : ''}. ${guidance}`;
+    if (live && (decisionsError || unreadable.length)) {
+      const what = [decisionsError ? 'the human\'s decisions' : null, unreadable.length ? `${unreadable.length === 1 ? 'a review' : `${unreadable.length} reviews`} (${unreadable.map((r) => r.ticket).join(', ')})` : null].filter(Boolean).join(' and ');
+      guidance = `Grove couldn't read ${what} in full from the board just now, so what's below is incomplete. Don't continue or submit work that depends on it: call grove_next again in a moment. If this keeps happening, call grove_blocked with what you see. ${guidance}`;
+    }
+    const out = { task: task.id, stage: stageLabel(task), guidance, ...(work ? { work } : {}),
       ...(task.destination ? { destination: task.destination, placement: task.placement ?? { status: 'unknown' } } : {}),
       ...(task.workspaceRepair ? { workspaceRepair: {
         target: task.workspaceRepair.target,
@@ -1896,7 +1957,91 @@ export class GroveProcess {
           properties: { workspaceConfirmation: confirmationForm(task.workspaceRepair.target) },
         } },
       } } : {}),
-      hires, messages: messages.map(({ id, ...m }) => m), inFlight, steps: this.stepsSummary(task), ...(results ? { results } : {}) };
+      hires, messages: messages.map(({ id, ...m }) => m), inFlight, steps: this.stepsSummary(task), ...(results ? { results } : {}),
+      ...(live ? { decisions, reviews } : {}),
+      ...(decisionsError && live ? { decisionsUnavailable: decisionsError } : {}),
+      ...(unreadable.length ? { reviewsIncomplete: unreadable.map((r) => ({ ticket: r.ticket, error: r.error })) } : {}) };
+    // Seen now: a late relay for any of these reports is no longer news.
+    this.unseenReports.clear();
+    if (!decisionsError) this.consumeDecisions(task, decisions);
+    return out;
+  }
+
+  // Engineer: whether there are decisions it hasn't read in grove_next yet. If the board can't be read, assume so.
+  async hasUnreadDecisions(task) {
+    try {
+      const from = task.consumedDecisionSeq ?? 0;
+      return (await this.board.readDecisions(task.id)).some((d) => d.seq > from && !QUIET_DECISIONS.has(d.action));
+    } catch { return true; }
+  }
+
+  // Engineer: the human's decisions it hasn't read in grove_next yet, oldest first (or just the given ones if
+  // the board can't be read).
+  async unreadDecisions(task, fallback = []) {
+    const from = task.consumedDecisionSeq ?? 0;
+    let all;
+    try { all = await this.board.readDecisions(task.id); } catch { all = fallback; }
+    const unread = all.filter((d) => d.seq > from && !QUIET_DECISIONS.has(d.action));
+    return unread.length ? unread : fallback.filter((d) => !QUIET_DECISIONS.has(d.action));
+  }
+
+  // grove_next's "decisions": every decision past the engineer's read cursor, with the human's full words.
+  async decisionsFor(task) {
+    if (task.consumedDecisionSeq === undefined && this.engine.owns(task)) {
+      // Tasks from before the cursor existed: show what's on the board once, flagged, rather than guess.
+      task.consumedDecisionSeq = 0;
+      task.decisionCursorLegacyMax = task.decisionsApplied ?? 0;
+      this.engine.changed(task, null);
+    }
+    const from = task.consumedDecisionSeq ?? 0;
+    const legacy = task.decisionCursorLegacyMax;
+    return (await this.board.readDecisions(task.id)).filter((d) => d.seq > from).map((d) => ({
+      seq: d.seq, action: d.action, note: d.note ?? '', at: d.at, applied: d.seq <= (task.decisionsApplied ?? 0),
+      ...(legacy !== undefined && d.seq <= legacy ? { historical: true } : {}),
+    }));
+  }
+
+  // Advance the read cursor once grove_next's answer is built, so a failure before then shows them again.
+  consumeDecisions(task, decisions) {
+    // Only the session that owns the task moves its cursor; elsewhere it stays put (and nothing is persisted).
+    if (!this.engine.owns(task)) return;
+    const max = Math.max(task.consumedDecisionSeq ?? 0, ...decisions.map((d) => d.seq));
+    const legacy = task.decisionCursorLegacyMax !== undefined;
+    if (max === (task.consumedDecisionSeq ?? 0) && !legacy) return;
+    task.consumedDecisionSeq = max;
+    delete task.decisionCursorLegacyMax;
+    this.engine.changed(task, null);
+  }
+
+  // grove_next's "reviews": the full text of each finished review in the current round (or, between rounds,
+  // the round that just closed, which stays here on every grove_next until the next round starts). Earlier
+  // rounds, and cancelled or failed hires, are left out. Each says where its text came from: "results" is the
+  // reviewer's own full report; "forum" is the copy on the step's forum (clipped at 12000 characters), used
+  // when the report can't be read, with "error" saying why ("missing", "mismatch" or the board's error code).
+  async reviewsFor(task) {
+    const cur = currentStep(task);
+    const step = cur?.forum?.round > 0 ? cur
+      : [...(task.steps ?? [])].filter((s) => s.forum?.round > 0 && s.status === 'done').at(-1);
+    if (!step) return [];
+    const round = step.forum.round;
+    const out = [];
+    for (const k of task.tickets) {
+      if (k.step !== step.id || k.round !== round || k.status !== 'done') continue;
+      let r = null;
+      let error = null;
+      try { r = await this.board.readResult(k.id); } catch (e) { error = e?.code ?? 'storage_failed'; }
+      if (!error && !r) error = 'missing';
+      else if (!error && !(r.ticket === k.id && r.token === k.token && r.status === 'done' && typeof r.text === 'string')) error = 'mismatch';
+      const post = step.forum.posts.filter((p) => p.kind === 'review' && p.round === round && p.role === k.specialty && p.author === memberTitle(k)).at(-1);
+      const review = { ticket: k.id, step: step.id, round, reviewer: memberTitle(k), verdict: post?.verdict ?? null };
+      if (!error) out.push({ ...review, text: r.text, source: 'results', complete: true });
+      else {
+        const text = post?.text ?? '';
+        const clipped = text.length >= 12000;
+        out.push({ ...review, text, source: 'forum', complete: !!post && !clipped, ...(clipped ? { clipped: true } : {}), error });
+      }
+    }
+    return out;
   }
 
   // What the engineer should do when no step is in progress.
@@ -1912,7 +2057,7 @@ export class GroveProcess {
     const lastStep = task.steps.filter((s) => s.status === 'done').at(-1);
     if (task.deliveries && !task.delivery && human) {
       const pr = task.ship?.pr ? ` The change already has a draft PR (${task.ship.pr.url}); push fixes to its branch, and the PR is reused when you deliver again.` : '';
-      return `The human asked for more: "${human.text.slice(0, 600)}". Plan the steps that address it with grove_plan_steps (redoFrom to re-run a finished step with their feedback, or new steps), then call grove_next.${pr}`;
+      return `The human asked for more: "${human.text}". Plan the steps that address it with grove_plan_steps (redoFrom to re-run a finished step with their feedback, or new steps), then call grove_next.${pr}`;
     }
     if (failed && failed === lastStep) {
       return `${failed.id} verification FAILED (see results). Plan the fix with grove_plan_steps, usually redoFrom the execute step, with a note on what to fix. Or, if it can't be fixed, deliver with grove_deliver and explain.`;
