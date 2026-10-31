@@ -1430,7 +1430,7 @@ export class GroveProcess {
       if (!task) return null;
       const r = seq ? this.engine.decisionResult(task, seq) : null;
       const how = r ? ` (result: ${r.result}${r.reason ? `: ${r.reason}` : ''})` : '';
-      if (seq && seq <= before) return `${engineerContext(task, { initial: false })} Decision #${seq} was already handled${how}; nothing to do. End your turn with one short line.`;
+      if (seq && seq <= before) return `${engineerContext(task, { initial: false })} Decision #${seq} was already applied${how}; call grove_next if you haven't since.`;
       if (r && r.result !== 'applied') return `${engineerContext(task, { initial: false })} Decision #${seq} was not applied${how}. Call grove_next now and do what it says.`;
       return `${engineerContext(task, { initial: false })} Grove applied the human's decision. Call grove_next now and do what it says.`;
     }

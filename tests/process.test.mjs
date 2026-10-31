@@ -800,7 +800,7 @@ assert.ok(!chief.proc.liveView().process.inbox.items.some((x) => x.taskId === 'T
 // A stale relay of the overtaken complete reaches the new engineer: nothing to do.
 const d1 = (await chief.proc.board.readDecisions('T6')).find((x) => x.seq === 1);
 back = await send(chief, eng6b.link, decisionMessage(chief.proc.board.id, chief.proc.engine.task('T6'), d1));
-assert.match(back.context, /Decision #1 was already handled \(result: superseded: overtaken by cancel #2\); nothing to do/);
+assert.match(back.context, /Decision #1 was already applied \(result: superseded: overtaken by cancel #2\); call grove_next if you haven't since/);
 assert.equal(eng6b.proc.engine.task('T6').stage, 'cancelled');
 
 // 16c. Another task is untouched by all that. Its engineer claims before the Chief sees create_session's
